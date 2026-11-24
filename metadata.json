@@ -1,0 +1,6 @@
+{
+  "name": "Lumen Chat",
+  "description": "Fast, streaming AI workspace powered by Google Gemini with persistent local conversation history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

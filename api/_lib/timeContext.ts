@@ -1,0 +1,72 @@
+export interface PakistanDateTimeInfo {
+  isoTimestamp: string;
+  date: string;
+  dayOfWeek: string;
+  year: string;
+  time12Hour: string;
+  time24Hour: string;
+  timezone: string;
+}
+
+const PAKISTAN_TIMEZONE = 'Asia/Karachi';
+
+export function getPakistanDateTime(now: Date = new Date()): PakistanDateTimeInfo {
+  const date = new Intl.DateTimeFormat('en-US', {
+    timeZone: PAKISTAN_TIMEZONE,
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  }).format(now);
+
+  const dayOfWeek = new Intl.DateTimeFormat('en-US', {
+    timeZone: PAKISTAN_TIMEZONE,
+    weekday: 'long',
+  }).format(now);
+
+  const year = new Intl.DateTimeFormat('en-US', {
+    timeZone: PAKISTAN_TIMEZONE,
+    year: 'numeric',
+  }).format(now);
+
+  const time12Hour = new Intl.DateTimeFormat('en-US', {
+    timeZone: PAKISTAN_TIMEZONE,
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+  }).format(now);
+
+  const time24Hour = new Intl.DateTimeFormat('en-GB', {
+    timeZone: PAKISTAN_TIMEZONE,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(now);
+
+  return {
+    isoTimestamp: now.toISOString(),
+    date,
+    dayOfWeek,
+    year,
+    time12Hour,
+    time24Hour,
+    timezone: 'Asia/Karachi (PKT, UTC+05:00)',
+  };
+}
+
+export function buildSystemInstruction(
+  baseInstruction: string,
+  now: Date = new Date()
+): string {
+  const pkt = getPakistanDateTime(now);
+  return `${baseInstruction}
+
+Real-Time Server Context (authoritative for this request):
+Current date: ${pkt.dayOfWeek}, ${pkt.date}
+Current year: ${pkt.year}
+Current time: ${pkt.time12Hour} (${pkt.time24Hour})
+Timezone: ${pkt.timezone}
+ISO UTC timestamp: ${pkt.isoTimestamp}
+Date & Time Rules: Always answer date, day, year, and time questions using the exact Real-Time Server Context above. Never use training-data dates/times, never guess, and never confuse UTC with Pakistan Standard Time.`;
+}
