@@ -16,7 +16,7 @@ import {
 } from '../utils/storage';
 
 // Send only recent relevant conversation turns to minimize payload and latency
-const MAX_HISTORY_MESSAGES = 10;
+const MAX_HISTORY_MESSAGES = 8;
 
 interface StreamParams {
   conversationId: string;
@@ -41,10 +41,17 @@ function buildCompactHistory(
 }
 
 export function useConversations() {
-  const [conversations, setConversations] = useState<Conversation[]>(() => loadConversations());
+  const initialConversationsRef = useRef<Conversation[] | null>(null);
+  if (initialConversationsRef.current === null) {
+    initialConversationsRef.current = loadConversations();
+  }
+
+  const [conversations, setConversations] = useState<Conversation[]>(
+    () => initialConversationsRef.current ?? []
+  );
   const [activeChatId, setActiveChatId] = useState<string | null>(() => {
     const saved = loadActiveChatId();
-    const list = loadConversations();
+    const list = initialConversationsRef.current ?? [];
     if (saved && list.some((c) => c.id === saved)) {
       return saved;
     }
@@ -53,12 +60,23 @@ export function useConversations() {
   const [model, setModel] = useState<GeminiModelId>(() => loadModel());
   const [streamingChatId, setStreamingChatId] = useState<string | null>(null);
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const [streamingText, setStreamingText] = useState<string>('');
   const [error, setError] = useState<ChatError | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const isStreamingRef = useRef(false);
   const conversationsRef = useRef<Conversation[]>(conversations);
   conversationsRef.current = conversations;
+  const activeStreamRef = useRef<{
+    chatId: string;
+    messageId: string;
+    text: string;
+  } | null>(null);
+
+  // Pre-warm /api/chat serverless function on mount so cold start finishes before first prompt
+  useEffect(() => {
+    fetch('/api/chat', {method: 'GET'}).catch(() => {});
+  }, []);
 
   useEffect(() => {
     saveActiveChatId(activeChatId);
@@ -75,10 +93,28 @@ export function useConversations() {
     }
   }, [conversations, streamingChatId]);
 
-  // Ensure latest state is flushed if tab closes mid-stream
+  // Flush any in-flight streamed text if the user closes the tab mid-stream
   useEffect(() => {
     const handleBeforeUnload = () => {
-      saveConversations(conversationsRef.current);
+      const currentStream = activeStreamRef.current;
+      if (currentStream && currentStream.text.trim()) {
+        const snapshot = conversationsRef.current.map((c) =>
+          c.id === currentStream.chatId
+            ? {
+                ...c,
+                updatedAt: Date.now(),
+                messages: c.messages.map((m) =>
+                  m.id === currentStream.messageId
+                    ? {...m, content: currentStream.text}
+                    : m
+                ),
+              }
+            : c
+        );
+        saveConversations(snapshot);
+      } else {
+        saveConversations(conversationsRef.current);
+      }
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
@@ -176,40 +212,59 @@ export function useConversations() {
       const controller = new AbortController();
       abortControllerRef.current = controller;
       isStreamingRef.current = true;
+      activeStreamRef.current = {chatId: conversationId, messageId: assistantMessageId, text: ''};
       setStreamingChatId(conversationId);
       setStreamingMessageId(assistantMessageId);
+      setStreamingText('');
       setError(null);
 
       let accumulatedText = '';
       let firstTokenRendered = false;
       let rafId: number | null = null;
 
-      const flushTextToState = () => {
-        rafId = null;
-        const snapshot = accumulatedText;
+      const commitFinalText = (finalText: string) => {
         setConversations((prev) =>
-          prev.map((c) => {
-            if (c.id !== conversationId) return c;
-            return {
-              ...c,
-              updatedAt: Date.now(),
-              messages: c.messages.map((m) =>
-                m.id === assistantMessageId ? {...m, content: snapshot} : m
-              ),
-            };
-          })
+          prev.map((c) =>
+            c.id === conversationId
+              ? {
+                  ...c,
+                  updatedAt: Date.now(),
+                  messages: c.messages.map((m) =>
+                    m.id === assistantMessageId ? {...m, content: finalText} : m
+                  ),
+                }
+              : c
+          )
         );
+      };
+
+      const removePlaceholder = () => {
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === conversationId
+              ? {
+                  ...c,
+                  messages: c.messages.filter((m) => m.id !== assistantMessageId),
+                }
+              : c
+          )
+        );
+      };
+
+      const flushStreamingText = () => {
+        rafId = null;
+        setStreamingText(accumulatedText);
       };
 
       const scheduleRender = () => {
         // Render first token synchronously with zero delay, then batch rapid bursts per animation frame
         if (!firstTokenRendered) {
           firstTokenRendered = true;
-          flushTextToState();
+          flushStreamingText();
           return;
         }
         if (rafId === null) {
-          rafId = window.requestAnimationFrame(flushTextToState);
+          rafId = window.requestAnimationFrame(flushStreamingText);
         }
       };
 
@@ -234,6 +289,9 @@ export function useConversations() {
 
         if (typeof eventData.text === 'string' && eventData.text.length > 0) {
           accumulatedText += eventData.text;
+          if (activeStreamRef.current) {
+            activeStreamRef.current.text = accumulatedText;
+          }
           scheduleRender();
         }
       };
@@ -305,8 +363,7 @@ export function useConversations() {
           );
         }
 
-        // Flush final complete text synchronously
-        flushTextToState();
+        commitFinalText(accumulatedText);
         return true;
       } catch (err) {
         if (rafId !== null) {
@@ -316,18 +373,9 @@ export function useConversations() {
 
         if (controller.signal.aborted) {
           if (accumulatedText.trim()) {
-            flushTextToState();
+            commitFinalText(accumulatedText);
           } else {
-            setConversations((prev) =>
-              prev.map((c) =>
-                c.id === conversationId
-                  ? {
-                      ...c,
-                      messages: c.messages.filter((m) => m.id !== assistantMessageId),
-                    }
-                  : c
-              )
-            );
+            removePlaceholder();
           }
           return false;
         }
@@ -344,18 +392,9 @@ export function useConversations() {
         });
 
         if (accumulatedText.trim()) {
-          flushTextToState();
+          commitFinalText(accumulatedText);
         } else {
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id === conversationId
-                ? {
-                    ...c,
-                    messages: c.messages.filter((m) => m.id !== assistantMessageId),
-                  }
-                : c
-            )
-          );
+          removePlaceholder();
         }
         return false;
       } finally {
@@ -365,9 +404,11 @@ export function useConversations() {
         if (abortControllerRef.current === controller) {
           abortControllerRef.current = null;
         }
+        activeStreamRef.current = null;
         isStreamingRef.current = false;
         setStreamingChatId(null);
         setStreamingMessageId(null);
+        setStreamingText('');
       }
     },
     [stopGeneration]
@@ -591,6 +632,7 @@ export function useConversations() {
     setModel,
     isStreaming,
     streamingMessageId,
+    streamingText,
     error,
     dismissError,
     createChat,

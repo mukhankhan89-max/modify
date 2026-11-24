@@ -1,4 +1,4 @@
-import {useState} from 'react';
+import {useCallback, useState} from 'react';
 import {ChatWindow} from './components/ChatWindow';
 import {ConfirmationDialog} from './components/ConfirmationDialog';
 import {Sidebar} from './components/Sidebar';
@@ -16,6 +16,7 @@ export default function App() {
     setModel,
     isStreaming,
     streamingMessageId,
+    streamingText,
     error,
     dismissError,
     createChat,
@@ -34,6 +35,13 @@ export default function App() {
   const [chatToDelete, setChatToDelete] = useState<Conversation | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
 
+  const openDesktopSidebar = useCallback(() => setIsDesktopSidebarOpen(true), []);
+  const closeDesktopSidebar = useCallback(() => setIsDesktopSidebarOpen(false), []);
+  const openMobileSidebar = useCallback(() => setIsMobileSidebarOpen(true), []);
+  const closeMobileSidebar = useCallback(() => setIsMobileSidebarOpen(false), []);
+  const requestDeleteChat = useCallback((conv: Conversation) => setChatToDelete(conv), []);
+  const requestClearAll = useCallback(() => setConfirmClearAll(true), []);
+
   return (
     <div className="flex h-dvh w-full overflow-hidden bg-white text-slate-900 dark:bg-[#0B0F17] dark:text-slate-100">
       <Sidebar
@@ -42,13 +50,13 @@ export default function App() {
         theme={theme}
         isDesktopOpen={isDesktopSidebarOpen}
         isMobileOpen={isMobileSidebarOpen}
-        onCloseDesktop={() => setIsDesktopSidebarOpen(false)}
-        onCloseMobile={() => setIsMobileSidebarOpen(false)}
+        onCloseDesktop={closeDesktopSidebar}
+        onCloseMobile={closeMobileSidebar}
         onNewChat={createChat}
         onSelectChat={selectChat}
         onRenameChat={renameChat}
-        onRequestDeleteChat={(conv) => setChatToDelete(conv)}
-        onRequestClearAll={() => setConfirmClearAll(true)}
+        onRequestDeleteChat={requestDeleteChat}
+        onRequestClearAll={requestClearAll}
         onToggleTheme={toggleTheme}
       />
 
@@ -58,10 +66,11 @@ export default function App() {
           model={model}
           isStreaming={isStreaming}
           streamingMessageId={streamingMessageId}
+          streamingText={streamingText}
           error={error}
           isDesktopSidebarOpen={isDesktopSidebarOpen}
-          onOpenDesktopSidebar={() => setIsDesktopSidebarOpen(true)}
-          onOpenMobileSidebar={() => setIsMobileSidebarOpen(true)}
+          onOpenDesktopSidebar={openDesktopSidebar}
+          onOpenMobileSidebar={openMobileSidebar}
           onNewChat={createChat}
           onChangeModel={setModel}
           onSendMessage={sendMessage}

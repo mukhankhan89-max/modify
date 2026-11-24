@@ -18,7 +18,7 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite', 'gemini-4-hydrogen']);
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
-const MAX_HISTORY_MESSAGES = 10;
+const MAX_HISTORY_MESSAGES = 8;
 
 interface IncomingMessage {
   role: 'user' | 'assistant';
@@ -189,29 +189,8 @@ function classifyGeminiError(err: unknown): {
   };
 }
 
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error('Aborted'));
-      return;
-    }
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new Error('Aborted'));
-    };
-    signal.addEventListener('abort', onAbort, {once: true});
-  });
-}
-
-const BASE_SYSTEM_INSTRUCTION = `You are Lumen, an ultra-fast, accurate, friendly AI assistant.
-Priority: Speed, Accuracy, Clarity, Usefulness, Conciseness.
-Style: Answer directly without intros, filler, repetition, or disclaimers. Never start with "Sure!", "Of course!", or "Certainly!", never repeat the user's question, and skip generic endings like "Let me know if you need anything else." Keep simple answers to 1-3 sentences, normal answers to 2-6 sentences, and complex topics structured and concise unless asked to expand. Use bullets only when they aid readability.
-Smart & Coding: Infer intent without unnecessary clarifying questions. Give clean, optimized code in fenced Markdown blocks with language tags, and state root causes first when debugging.
-Language: Reply in the user's language (English, Urdu, Roman Urdu, or mixed). If the user writes in Roman Urdu, reply in natural Roman Urdu.`;
+const BASE_SYSTEM_INSTRUCTION =
+  'You are Lumen, a fast, friendly AI assistant. Answer directly in 1-5 sentences by default (no intros, filler, "Sure!", or sign-offs); expand only when asked. Reply in the user\'s language (English, Urdu, or Roman Urdu). Give clean fenced code blocks with language tags.';
 
 async function startServer() {
   const app = express();
@@ -220,6 +199,12 @@ async function startServer() {
   app.get('/api/health', (_req, res) => {
     const hasKey = Boolean(getGenAIClient());
     res.json({ok: true, configured: hasKey});
+  });
+
+  app.get('/api/chat', (_req, res) => {
+    const configured = Boolean(getGenAIClient());
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ok: true, configured});
   });
 
   app.post('/api/chat', async (req, res) => {
@@ -267,14 +252,19 @@ async function startServer() {
         ? body.model
         : DEFAULT_MODEL;
 
-    const contents = validMessages.map((m) => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{text: m.content}],
-    }));
+    const contents = validMessages.map((m, idx) => {
+      const isRecent = idx >= validMessages.length - 2;
+      const text = !isRecent && m.content.length > 900 ? `${m.content.slice(0, 900)}...` : m.content;
+      return {
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{text}],
+      };
+    });
 
-    // SSE headers for instant word-by-word streaming
+    // SSE headers for instant word-by-word streaming without proxy buffering
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Content-Encoding', 'identity');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
@@ -294,69 +284,42 @@ async function startServer() {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     };
 
+    if (!clientClosed && !res.writableEnded) {
+      res.write(': open\n\n');
+    }
+
     let totalEmitted = 0;
-    const attemptStream = async (
-      modelId: string,
-      firstTokenTimeoutMs?: number
-    ): Promise<void> => {
-      const attemptController = new AbortController();
-      const onOuterAbort = () => attemptController.abort();
-      abortController.signal.addEventListener('abort', onOuterAbort, {once: true});
-
-      let timedOut = false;
-      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-      if (firstTokenTimeoutMs && firstTokenTimeoutMs > 0) {
-        timeoutHandle = setTimeout(() => {
-          timedOut = true;
-          attemptController.abort();
-        }, firstTokenTimeoutMs);
-      }
-
+    const attemptStream = async (modelId: string): Promise<void> => {
       const dynamicSystemInstruction = buildSystemInstruction(BASE_SYSTEM_INSTRUCTION);
+      const config =
+        modelId === 'gemini-4-hydrogen'
+          ? {
+              systemInstruction: dynamicSystemInstruction,
+              thinkingConfig: {thinkingLevel: ThinkingLevel.LOW},
+              abortSignal: abortController.signal,
+            }
+          : {
+              systemInstruction: dynamicSystemInstruction,
+              maxOutputTokens: 1024,
+              abortSignal: abortController.signal,
+            };
 
-      try {
-        const config =
-          modelId === 'gemini-4-hydrogen'
-            ? {
-                systemInstruction: dynamicSystemInstruction,
-                thinkingConfig: {thinkingLevel: ThinkingLevel.LOW},
-                abortSignal: attemptController.signal,
-              }
-            : {
-                systemInstruction: dynamicSystemInstruction,
-                abortSignal: attemptController.signal,
-              };
+      const stream = await ai.models.generateContentStream({
+        model: modelId,
+        contents,
+        config,
+      });
 
-        const stream = await ai.models.generateContentStream({
-          model: modelId,
-          contents,
-          config,
-        });
-
-        for await (const chunk of stream) {
-          if (clientClosed) break;
-          if (timeoutHandle) {
-            clearTimeout(timeoutHandle);
-            timeoutHandle = null;
-          }
-          const text = chunk.text;
-          if (text) {
-            totalEmitted += text.length;
-            writeEvent({text});
-          }
+      for await (const chunk of stream) {
+        if (clientClosed) break;
+        const text = chunk.text;
+        if (text) {
+          totalEmitted += text.length;
+          writeEvent({text});
         }
-      } catch (err) {
-        if (timedOut && !abortController.signal.aborted) {
-          throw new Error(`503 First-token timeout after ${firstTokenTimeoutMs}ms on ${modelId}`);
-        }
-        throw err;
-      } finally {
-        if (timeoutHandle) clearTimeout(timeoutHandle);
-        abortController.signal.removeEventListener('abort', onOuterAbort);
       }
     };
 
-    // Fast failover between free-tier Flash-class models if upstream stalls >5s or returns 503
     const alternateModel =
       requestedModel === 'gemini-3.1-flash-lite' ? 'gemini-4-hydrogen' : FALLBACK_MODEL;
     const modelsToTry = [requestedModel, alternateModel];
@@ -366,10 +329,9 @@ async function startServer() {
     for (let i = 0; i < modelsToTry.length; i++) {
       if (clientClosed || abortController.signal.aborted) break;
       const targetModel = modelsToTry[i];
-      const hasFallbackNext = i < modelsToTry.length - 1;
 
       try {
-        await attemptStream(targetModel, hasFallbackNext ? 5000 : undefined);
+        await attemptStream(targetModel);
         lastError = null;
         break;
       } catch (err) {
@@ -386,16 +348,6 @@ async function startServer() {
         // Do not retry if chunks were already streamed or error is non-retryable
         if (totalEmitted > 0 || !classified.retryable) {
           break;
-        }
-
-        // Wait briefly before retry or fallback
-        if (i < modelsToTry.length - 1) {
-          try {
-            await sleep(150 * (i + 1), abortController.signal);
-          } catch {
-            if (!res.writableEnded) res.end();
-            return;
-          }
         }
       }
     }

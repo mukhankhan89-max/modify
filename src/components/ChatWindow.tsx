@@ -18,6 +18,7 @@ interface ChatWindowProps {
   model: GeminiModelId;
   isStreaming: boolean;
   streamingMessageId: string | null;
+  streamingText: string;
   error: ChatError | null;
   isDesktopSidebarOpen: boolean;
   onOpenDesktopSidebar: () => void;
@@ -55,6 +56,7 @@ export function ChatWindow({
   model,
   isStreaming,
   streamingMessageId,
+  streamingText,
   error,
   isDesktopSidebarOpen,
   onOpenDesktopSidebar,
@@ -100,7 +102,7 @@ export function ChatWindow({
   }, [conversation?.id]);
 
   // Auto-scroll smoothly during streaming if user has not scrolled up
-  const lastMessageContent = messages[messages.length - 1]?.content ?? '';
+  const lastMessageContent = streamingText || messages[messages.length - 1]?.content || '';
   useEffect(() => {
     if (!shouldAutoScroll || messages.length === 0) return;
     if (isStreaming && scrollContainerRef.current) {
@@ -228,17 +230,21 @@ export function ChatWindow({
           </div>
         ) : (
           <div className="w-full max-w-3xl mx-auto px-3 sm:px-6 py-6 space-y-7">
-            {messages.map((msg) => (
-              <ChatMessage
-                key={msg.id}
-                message={msg}
-                isStreamingThis={isStreaming && msg.id === streamingMessageId}
-                isAnyStreaming={isStreaming}
-                isLastAssistant={msg.id === lastAssistantId}
-                onEditMessage={onEditMessage}
-                onRegenerate={onRegenerate}
-              />
-            ))}
+            {messages.map((msg) => {
+              const isStreamingThis = isStreaming && msg.id === streamingMessageId;
+              const effectiveMsg = isStreamingThis ? {...msg, content: streamingText} : msg;
+              return (
+                <ChatMessage
+                  key={msg.id}
+                  message={effectiveMsg}
+                  isStreamingThis={isStreamingThis}
+                  isAnyStreaming={isStreaming}
+                  isLastAssistant={msg.id === lastAssistantId}
+                  onEditMessage={onEditMessage}
+                  onRegenerate={onRegenerate}
+                />
+              );
+            })}
             <div ref={bottomAnchorRef} className="h-2" />
           </div>
         )}

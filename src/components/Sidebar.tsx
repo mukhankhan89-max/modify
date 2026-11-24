@@ -1,5 +1,5 @@
 import {PanelLeftClose, Trash2, X} from 'lucide-react';
-import {useState} from 'react';
+import {memo, useState} from 'react';
 import type {Conversation, ThemeMode} from '../types/chat';
 import {ChatHistory} from './ChatHistory';
 import {NewChatButton} from './NewChatButton';
@@ -22,7 +22,7 @@ interface SidebarProps {
   onToggleTheme: () => void;
 }
 
-export function Sidebar({
+export const Sidebar = memo(function Sidebar({
   conversations,
   activeChatId,
   theme,
@@ -144,4 +144,4 @@ export function Sidebar({
       </div>
     </>
   );
-}
+});

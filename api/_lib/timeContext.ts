@@ -61,12 +61,5 @@ export function buildSystemInstruction(
 ): string {
   const pkt = getPakistanDateTime(now);
   return `${baseInstruction}
-
-Real-Time Server Context (authoritative for this request):
-Current date: ${pkt.dayOfWeek}, ${pkt.date}
-Current year: ${pkt.year}
-Current time: ${pkt.time12Hour} (${pkt.time24Hour})
-Timezone: ${pkt.timezone}
-ISO UTC timestamp: ${pkt.isoTimestamp}
-Date & Time Rules: Always answer date, day, year, and time questions using the exact Real-Time Server Context above. Never use training-data dates/times, never guess, and never confuse UTC with Pakistan Standard Time.`;
+Now (PKT, Asia/Karachi UTC+05:00): ${pkt.dayOfWeek}, ${pkt.date}, ${pkt.time12Hour} (${pkt.time24Hour}). Use this exact date/time for any date, day, year, or time question; never guess or use UTC.`;
 }
