@@ -2,10 +2,30 @@ export type MessageRole = 'user' | 'assistant';
 
 export type GeminiModelId = 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
 
+export type SpeechLanguage = 'en-US' | 'ur-PK';
+
+export type SpeechRate = 0.75 | 1 | 1.25 | 1.5;
+
+export interface ImageAttachmentRef {
+  id: string;
+  name: string;
+  mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
+  size: number;
+  width: number;
+  height: number;
+  thumbnailDataUrl: string;
+}
+
+export interface PreparedImageAttachment extends ImageAttachmentRef {
+  base64: string;
+  dataUrl: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: MessageRole;
   content: string;
+  attachments?: ImageAttachmentRef[];
   createdAt: number;
   updatedAt?: number;
   isError?: boolean;

@@ -8,10 +8,17 @@ import {
   Zap,
 } from 'lucide-react';
 import {useCallback, useEffect, useRef, useState} from 'react';
-import type {ChatError, Conversation, GeminiModelId} from '../types/chat';
+import {useSpeechSynthesis} from '../hooks/useSpeechSynthesis';
+import type {
+  ChatError,
+  Conversation,
+  GeminiModelId,
+  PreparedImageAttachment,
+} from '../types/chat';
 import {ChatInput} from './ChatInput';
 import {ChatMessage} from './ChatMessage';
 import {NewChatButton} from './NewChatButton';
+import {VoiceConversationModal} from './VoiceConversationModal';
 
 interface ChatWindowProps {
   conversation: Conversation | null;
@@ -25,7 +32,10 @@ interface ChatWindowProps {
   onOpenMobileSidebar: () => void;
   onNewChat: () => void;
   onChangeModel: (model: GeminiModelId) => void;
-  onSendMessage: (content: string) => void;
+  onSendMessage: (
+    content: string,
+    attachments?: PreparedImageAttachment[]
+  ) => Promise<string | null>;
   onStopGeneration: () => void;
   onRegenerate: (messageId?: string) => void;
   onEditMessage: (messageId: string, newContent: string) => void;
@@ -35,19 +45,23 @@ interface ChatWindowProps {
 const STARTER_PROMPTS = [
   {
     title: 'Explain a technical concept',
-    prompt: 'Explain how Server-Sent Events work compared to WebSockets, with a concise TypeScript example.',
+    prompt:
+      'Explain how Server-Sent Events work compared to WebSockets, with a concise TypeScript example.',
   },
   {
     title: 'Debug or optimize code',
-    prompt: 'Show 3 common React re-render bottlenecks and how to fix each one cleanly.',
+    prompt:
+      'Show 3 common React re-render bottlenecks and how to fix each one cleanly.',
   },
   {
     title: 'Draft clear communication',
-    prompt: 'Write a concise project update email summarizing completed milestones, risks, and next steps.',
+    prompt:
+      'Write a concise project update email summarizing completed milestones, risks, and next steps.',
   },
   {
     title: 'Brainstorm architecture',
-    prompt: 'Design a clean folder structure and data flow for a local-first web application.',
+    prompt:
+      'Design a clean folder structure and data flow for a local-first web application.',
   },
 ];
 
@@ -73,6 +87,22 @@ export function ChatWindow({
   const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
+  const [isVoiceModeOpen, setIsVoiceModeOpen] = useState(false);
+  const [previewImage, setPreviewImage] = useState<{
+    src: string;
+    alt: string;
+  } | null>(null);
+
+  const {
+    speakingMessageId,
+    playbackState,
+    rate: speechRate,
+    error: speechError,
+    togglePlayPause,
+    stop: stopSpeech,
+    setRate: setSpeechRate,
+    dismissError: dismissSpeechError,
+  } = useSpeechSynthesis();
 
   const messages = conversation?.messages ?? [];
   const lastAssistantId = [...messages]
@@ -94,15 +124,27 @@ export function ChatWindow({
     setShowJumpToBottom(false);
   }, []);
 
-  // Scroll when switching conversations
+  // Scroll & stop active message speech when switching conversations
   useEffect(() => {
+    stopSpeech();
     setShouldAutoScroll(true);
     setShowJumpToBottom(false);
     bottomAnchorRef.current?.scrollIntoView({behavior: 'auto', block: 'end'});
-  }, [conversation?.id]);
+  }, [conversation?.id, stopSpeech]);
+
+  // Close lightbox on Escape
+  useEffect(() => {
+    if (!previewImage) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPreviewImage(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [previewImage]);
 
   // Auto-scroll smoothly during streaming if user has not scrolled up
-  const lastMessageContent = streamingText || messages[messages.length - 1]?.content || '';
+  const lastMessageContent =
+    streamingText || messages[messages.length - 1]?.content || '';
   useEffect(() => {
     if (!shouldAutoScroll || messages.length === 0) return;
     if (isStreaming && scrollContainerRef.current) {
@@ -114,6 +156,27 @@ export function ChatWindow({
       });
     }
   }, [messages.length, lastMessageContent, shouldAutoScroll, isStreaming]);
+
+  const handlePreviewImage = useCallback((src: string, alt: string) => {
+    setPreviewImage({src, alt});
+  }, []);
+
+  const handleOpenVoiceMode = useCallback(() => {
+    stopSpeech();
+    setIsVoiceModeOpen(true);
+  }, [stopSpeech]);
+
+  const handleVoiceTurn = useCallback(
+    (transcript: string) => onSendMessage(transcript),
+    [onSendMessage]
+  );
+
+  const handleSendFromInput = useCallback(
+    (content: string, attachments?: PreparedImageAttachment[]) => {
+      void onSendMessage(content, attachments);
+    },
+    [onSendMessage]
+  );
 
   return (
     <div className="flex flex-1 flex-col min-w-0 h-full bg-white dark:bg-[#0B0F17]">
@@ -157,7 +220,7 @@ export function ChatWindow({
               type="button"
               onClick={() => onChangeModel('gemini-3.1-flash-lite')}
               disabled={isStreaming}
-              className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+              className={`inline-flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
                 model === 'gemini-3.1-flash-lite'
                   ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-slate-100'
                   : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
@@ -170,7 +233,7 @@ export function ChatWindow({
               type="button"
               onClick={() => onChangeModel('gemini-4-hydrogen')}
               disabled={isStreaming}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+              className={`inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
                 model === 'gemini-4-hydrogen'
                   ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-slate-100'
                   : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
@@ -205,7 +268,7 @@ export function ChatWindow({
                   What would you like to explore today?
                 </h2>
                 <p className="text-sm sm:text-base text-slate-500 dark:text-slate-400 max-w-lg mx-auto">
-                  Ask anything — responses stream in real time and your chats stay saved locally in your browser.
+                  Ask anything, upload an image or photo, or talk with Lumen by voice — chats stay saved locally in your browser.
                 </p>
               </div>
 
@@ -214,7 +277,7 @@ export function ChatWindow({
                   <button
                     key={item.title}
                     type="button"
-                    onClick={() => onSendMessage(item.prompt)}
+                    onClick={() => void onSendMessage(item.prompt)}
                     className="group flex flex-col items-start text-left rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 hover:bg-slate-100/90 dark:bg-[#111827] dark:hover:bg-slate-800/80 p-4 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 dark:focus-visible:ring-teal-400"
                   >
                     <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
@@ -232,7 +295,9 @@ export function ChatWindow({
           <div className="w-full max-w-3xl mx-auto px-3 sm:px-6 py-6 space-y-7">
             {messages.map((msg) => {
               const isStreamingThis = isStreaming && msg.id === streamingMessageId;
-              const effectiveMsg = isStreamingThis ? {...msg, content: streamingText} : msg;
+              const effectiveMsg = isStreamingThis
+                ? {...msg, content: streamingText}
+                : msg;
               return (
                 <ChatMessage
                   key={msg.id}
@@ -240,8 +305,17 @@ export function ChatWindow({
                   isStreamingThis={isStreamingThis}
                   isAnyStreaming={isStreaming}
                   isLastAssistant={msg.id === lastAssistantId}
+                  isSpeakingThis={speakingMessageId === msg.id}
+                  speechPlaybackState={
+                    speakingMessageId === msg.id ? playbackState : 'idle'
+                  }
+                  speechRate={speechRate}
                   onEditMessage={onEditMessage}
                   onRegenerate={onRegenerate}
+                  onToggleSpeak={togglePlayPause}
+                  onStopSpeak={stopSpeech}
+                  onChangeSpeechRate={setSpeechRate}
+                  onPreviewImage={handlePreviewImage}
                 />
               );
             })}
@@ -250,38 +324,57 @@ export function ChatWindow({
         )}
       </div>
 
-      {/* Error banner */}
-      {error && (
-        <div className="w-full max-w-3xl mx-auto px-3 sm:px-6 pb-2">
-          <div
-            role="alert"
-            className="flex items-start sm:items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 dark:border-red-900/60 dark:bg-red-950/40 px-4 py-3 text-sm text-red-800 dark:text-red-200"
-          >
-            <div className="flex items-start sm:items-center gap-2.5 min-w-0">
-              <AlertCircle className="h-4 w-4 shrink-0 text-red-600 dark:text-red-400 mt-0.5 sm:mt-0" />
-              <p className="text-xs sm:text-sm leading-snug">{error.message}</p>
-            </div>
-            <div className="flex items-center gap-1.5 shrink-0">
-              {error.retryable && !isStreaming && messages.length > 0 && (
+      {/* Error banners */}
+      {(error || speechError) && (
+        <div className="w-full max-w-3xl mx-auto px-3 sm:px-6 pb-2 space-y-2">
+          {error && (
+            <div
+              role="alert"
+              className="flex items-start sm:items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 dark:border-red-900/60 dark:bg-red-950/40 px-4 py-3 text-sm text-red-800 dark:text-red-200"
+            >
+              <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+                <AlertCircle className="h-4 w-4 shrink-0 text-red-600 dark:text-red-400 mt-0.5 sm:mt-0" />
+                <p className="text-xs sm:text-sm leading-snug">{error.message}</p>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {error.retryable && !isStreaming && messages.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => onRegenerate()}
+                    className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold bg-red-600 text-white hover:bg-red-700 transition-colors whitespace-nowrap"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    <span>Retry</span>
+                  </button>
+                )}
                 <button
                   type="button"
-                  onClick={() => onRegenerate()}
-                  className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold bg-red-600 text-white hover:bg-red-700 transition-colors whitespace-nowrap"
+                  onClick={onDismissError}
+                  aria-label="Dismiss error"
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-md text-red-600 hover:bg-red-100 dark:text-red-300 dark:hover:bg-red-900/50 transition-colors"
                 >
-                  <RotateCcw className="h-3.5 w-3.5" />
-                  <span>Retry</span>
+                  <X className="h-4 w-4" />
                 </button>
-              )}
+              </div>
+            </div>
+          )}
+
+          {speechError && (
+            <div
+              role="alert"
+              className="flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 dark:border-amber-900/60 dark:bg-amber-950/40 px-4 py-2.5 text-xs text-amber-900 dark:text-amber-200"
+            >
+              <span>{speechError}</span>
               <button
                 type="button"
-                onClick={onDismissError}
-                aria-label="Dismiss error"
-                className="inline-flex h-7 w-7 items-center justify-center rounded-md text-red-600 hover:bg-red-100 dark:text-red-300 dark:hover:bg-red-900/50 transition-colors"
+                onClick={dismissSpeechError}
+                aria-label="Dismiss speech notice"
+                className="inline-flex h-6 w-6 items-center justify-center rounded-md hover:bg-amber-200/60 dark:hover:bg-amber-900/50"
               >
-                <X className="h-4 w-4" />
+                <X className="h-3.5 w-3.5" />
               </button>
             </div>
-          </div>
+          )}
         </div>
       )}
 
@@ -303,11 +396,47 @@ export function ChatWindow({
       <div className="shrink-0 bg-white dark:bg-[#0B0F17]">
         <ChatInput
           isStreaming={isStreaming}
-          onSend={onSendMessage}
+          onSend={handleSendFromInput}
           onStop={onStopGeneration}
+          onOpenVoiceMode={handleOpenVoiceMode}
           autoFocusTrigger={conversation?.id ?? 'empty'}
         />
       </div>
+
+      {/* Real-time Voice Conversation Modal */}
+      <VoiceConversationModal
+        isOpen={isVoiceModeOpen}
+        streamingText={streamingText}
+        onSendVoiceTurn={handleVoiceTurn}
+        onStopGeneration={onStopGeneration}
+        onClose={() => setIsVoiceModeOpen(false)}
+      />
+
+      {/* Fullscreen Image Lightbox */}
+      {previewImage && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={previewImage.alt}
+          onClick={() => setPreviewImage(null)}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 p-4 backdrop-blur-xs"
+        >
+          <button
+            type="button"
+            onClick={() => setPreviewImage(null)}
+            aria-label="Close image preview"
+            className="absolute top-4 right-4 inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-900/80 text-white hover:bg-slate-800 transition-colors"
+          >
+            <X className="h-5 w-5" />
+          </button>
+          <img
+            src={previewImage.src}
+            alt={previewImage.alt}
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[88vh] max-w-[92vw] rounded-2xl object-contain shadow-2xl"
+          />
+        </div>
+      )}
     </div>
   );
 }

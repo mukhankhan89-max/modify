@@ -10,6 +10,12 @@
     },
     "api/title.ts": {
       "maxDuration": 30
+    },
+    "api/transcribe.ts": {
+      "maxDuration": 30
+    },
+    "api/tts.ts": {
+      "maxDuration": 30
     }
   },
   "rewrites": [

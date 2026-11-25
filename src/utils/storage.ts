@@ -1,18 +1,47 @@
-import type {Conversation, GeminiModelId, ThemeMode} from '../types/chat';
+import type {
+  Conversation,
+  GeminiModelId,
+  SpeechLanguage,
+  SpeechRate,
+  ThemeMode,
+} from '../types/chat';
 
 const CONVERSATIONS_KEY = 'lumen_conversations_v1';
 const ACTIVE_CHAT_KEY = 'lumen_active_chat_id_v1';
 const THEME_KEY = 'lumen_theme_v1';
 const MODEL_KEY = 'lumen_model_v1';
+const SPEECH_LANG_KEY = 'lumen_speech_lang_v1';
+const SPEECH_RATE_KEY = 'lumen_speech_rate_v1';
+
+function isValidAttachment(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const att = value as Record<string, unknown>;
+  return (
+    typeof att.id === 'string' &&
+    typeof att.name === 'string' &&
+    (att.mimeType === 'image/jpeg' ||
+      att.mimeType === 'image/png' ||
+      att.mimeType === 'image/webp') &&
+    typeof att.size === 'number' &&
+    typeof att.width === 'number' &&
+    typeof att.height === 'number' &&
+    typeof att.thumbnailDataUrl === 'string'
+  );
+}
 
 function isValidMessage(value: unknown): boolean {
   if (!value || typeof value !== 'object') return false;
   const msg = value as Record<string, unknown>;
+  const attachmentsValid =
+    msg.attachments === undefined ||
+    (Array.isArray(msg.attachments) && msg.attachments.every(isValidAttachment));
+
   return (
     typeof msg.id === 'string' &&
     (msg.role === 'user' || msg.role === 'assistant') &&
     typeof msg.content === 'string' &&
-    typeof msg.createdAt === 'number'
+    typeof msg.createdAt === 'number' &&
+    attachmentsValid
   );
 }
 
@@ -112,6 +141,48 @@ export function saveModel(model: GeminiModelId): void {
   if (typeof window === 'undefined') return;
   try {
     window.localStorage.setItem(MODEL_KEY, model);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function loadSpeechLanguage(): SpeechLanguage {
+  if (typeof window === 'undefined') return 'en-US';
+  try {
+    const saved = window.localStorage.getItem(SPEECH_LANG_KEY);
+    if (saved === 'en-US' || saved === 'ur-PK') return saved;
+    return 'en-US';
+  } catch {
+    return 'en-US';
+  }
+}
+
+export function saveSpeechLanguage(lang: SpeechLanguage): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(SPEECH_LANG_KEY, lang);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function loadSpeechRate(): SpeechRate {
+  if (typeof window === 'undefined') return 1;
+  try {
+    const saved = Number(window.localStorage.getItem(SPEECH_RATE_KEY));
+    if (saved === 0.75 || saved === 1 || saved === 1.25 || saved === 1.5) {
+      return saved;
+    }
+    return 1;
+  } catch {
+    return 1;
+  }
+}
+
+export function saveSpeechRate(rate: SpeechRate): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(SPEECH_RATE_KEY, String(rate));
   } catch {
     // Ignore storage errors
   }

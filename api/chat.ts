@@ -1,187 +1,15 @@
-import process from 'node:process';
-import {GoogleGenAI, ThinkingLevel} from '@google/genai';
+import {ThinkingLevel} from '@google/genai';
 import {buildSystemInstruction} from './_lib/timeContext.js';
-
-const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite', 'gemini-4-hydrogen']);
-const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
-const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
-const MAX_HISTORY_MESSAGES = 8;
-
-const BASE_SYSTEM_INSTRUCTION =
-  'You are Lumen, a fast, friendly AI assistant. Answer directly in 1-5 sentences by default (no intros, filler, "Sure!", or sign-offs); expand only when asked. Reply in the user\'s language (English, Urdu, or Roman Urdu). Give clean fenced code blocks with language tags.';
-
-interface IncomingMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-let cachedClient: GoogleGenAI | null = null;
-let cachedApiKey = '';
-
-function getGenAIClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    return null;
-  }
-  if (!cachedClient || cachedApiKey !== apiKey) {
-    cachedApiKey = apiKey;
-    cachedClient = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-  }
-  return cachedClient;
-}
-
-function extractNestedErrorMessage(raw: string): string {
-  let current = raw.trim();
-  for (let i = 0; i < 3; i++) {
-    if (!current.startsWith('{')) break;
-    try {
-      const parsed = JSON.parse(current) as {
-        error?: {message?: string} | string;
-        message?: string;
-      };
-      if (
-        parsed.error &&
-        typeof parsed.error === 'object' &&
-        typeof parsed.error.message === 'string'
-      ) {
-        current = parsed.error.message.trim();
-      } else if (typeof parsed.message === 'string') {
-        current = parsed.message.trim();
-      } else {
-        break;
-      }
-    } catch {
-      break;
-    }
-  }
-  return current;
-}
-
-function classifyGeminiError(err: unknown): {
-  status: number;
-  code: string;
-  message: string;
-  retryable: boolean;
-  detail: string;
-} {
-  const errObj = err as {status?: number; message?: string; code?: string} | null;
-  const rawMessage =
-    err instanceof Error
-      ? err.message
-      : typeof errObj?.message === 'string'
-        ? errObj.message
-        : typeof err === 'string'
-          ? err
-          : 'Unknown error';
-
-  const detail = extractNestedErrorMessage(rawMessage);
-  const upper = `${rawMessage} ${detail}`.toUpperCase();
-  const statusFromErr = typeof errObj?.status === 'number' ? errObj.status : 0;
-  const statusMatch = rawMessage.match(/\b(400|401|403|404|429|500|502|503|504)\b/);
-  const numericStatus = statusFromErr || (statusMatch ? Number(statusMatch[1]) : 500);
-
-  if (
-    upper.includes('API_KEY_INVALID') ||
-    upper.includes('API KEY NOT VALID') ||
-    upper.includes('INVALID API KEY') ||
-    numericStatus === 401
-  ) {
-    return {
-      status: 400,
-      code: 'API_KEY_INVALID',
-      message:
-        'Your Gemini API key is invalid. Please verify GEMINI_API_KEY in your environment variables.',
-      retryable: false,
-      detail,
-    };
-  }
-
-  if (upper.includes('PERMISSION_DENIED') || numericStatus === 403) {
-    return {
-      status: 403,
-      code: 'PERMISSION_DENIED',
-      message:
-        'Permission denied by Gemini API. Please check your GEMINI_API_KEY permissions.',
-      retryable: false,
-      detail,
-    };
-  }
-
-  if (
-    upper.includes('RESOURCE_EXHAUSTED') ||
-    upper.includes('QUOTA') ||
-    upper.includes('RATE LIMIT') ||
-    numericStatus === 429
-  ) {
-    return {
-      status: 429,
-      code: 'RATE_LIMIT',
-      message:
-        'Gemini free-tier rate limit or quota exceeded (429). Please wait a few seconds and retry.',
-      retryable: true,
-      detail,
-    };
-  }
-
-  if (upper.includes('NOT_FOUND') || numericStatus === 404) {
-    return {
-      status: 404,
-      code: 'MODEL_NOT_FOUND',
-      message: 'The selected Gemini model was not found (404). Try switching models and retrying.',
-      retryable: false,
-      detail,
-    };
-  }
-
-  if (
-    upper.includes('UNAVAILABLE') ||
-    upper.includes('OVERLOADED') ||
-    upper.includes('HIGH DEMAND') ||
-    numericStatus === 503
-  ) {
-    return {
-      status: 503,
-      code: 'SERVICE_UNAVAILABLE',
-      message:
-        'Gemini servers are temporarily busy (503). Please try again in a moment.',
-      retryable: true,
-      detail,
-    };
-  }
-
-  if (
-    upper.includes('FETCH') ||
-    upper.includes('ECONNREFUSED') ||
-    upper.includes('ENOTFOUND') ||
-    upper.includes('ETIMEDOUT') ||
-    upper.includes('ECONNRESET') ||
-    upper.includes('NETWORK')
-  ) {
-    return {
-      status: 503,
-      code: 'NETWORK_ERROR',
-      message: 'Network error while connecting to Gemini API. Check your connection and retry.',
-      retryable: true,
-      detail,
-    };
-  }
-
-  const cleanDetail = detail.length > 0 && detail.length <= 160 ? ` (${detail})` : '';
-  return {
-    status: numericStatus >= 400 && numericStatus < 600 ? numericStatus : 500,
-    code: 'GEMINI_ERROR',
-    message: `Gemini API error${cleanDetail}. Please try again.`,
-    retryable: numericStatus >= 500,
-    detail,
-  };
-}
+import {
+  ALLOWED_MODELS,
+  BASE_SYSTEM_INSTRUCTION,
+  buildGeminiContents,
+  classifyGeminiError,
+  DEFAULT_MODEL,
+  FALLBACK_MODEL,
+  getGenAIClient,
+  sanitizeIncomingMessages,
+} from './_lib/gemini.js';
 
 // Lightweight warmup endpoint so client mount pre-warms this Vercel function before first message
 export function GET(): Response {
@@ -216,28 +44,11 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  if (!Array.isArray(body?.messages) || body.messages.length === 0) {
+  const sanitized = sanitizeIncomingMessages(body?.messages);
+  if (sanitized.error) {
     return Response.json(
-      {code: 'INVALID_REQUEST', error: 'A non-empty messages array is required.'},
-      {status: 400}
-    );
-  }
-
-  const validMessages: IncomingMessage[] = body.messages
-    .filter(
-      (m): m is IncomingMessage =>
-        Boolean(m) &&
-        typeof m === 'object' &&
-        ((m as IncomingMessage).role === 'user' || (m as IncomingMessage).role === 'assistant') &&
-        typeof (m as IncomingMessage).content === 'string' &&
-        (m as IncomingMessage).content.trim().length > 0
-    )
-    .slice(-MAX_HISTORY_MESSAGES);
-
-  if (validMessages.length === 0) {
-    return Response.json(
-      {code: 'INVALID_REQUEST', error: 'Messages must contain valid text content.'},
-      {status: 400}
+      {code: sanitized.error.code, error: sanitized.error.message},
+      {status: sanitized.error.status}
     );
   }
 
@@ -246,14 +57,7 @@ export async function POST(request: Request): Promise<Response> {
       ? body.model
       : DEFAULT_MODEL;
 
-  const contents = validMessages.map((m, idx) => {
-    const isRecent = idx >= validMessages.length - 2;
-    const text = !isRecent && m.content.length > 900 ? `${m.content.slice(0, 900)}...` : m.content;
-    return {
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{text}],
-    };
-  });
+  const contents = buildGeminiContents(sanitized.messages);
 
   const encoder = new TextEncoder();
   const abortController = new AbortController();
