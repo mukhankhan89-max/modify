@@ -3,9 +3,12 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "framework": "vite",
-  "regions": ["sin1"],
+  "regions": ["bom1"],
   "functions": {
     "api/chat.ts": {
+      "maxDuration": 60
+    },
+    "api/image.ts": {
       "maxDuration": 60
     },
     "api/title.ts": {

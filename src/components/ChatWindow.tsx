@@ -13,6 +13,8 @@ import type {
   ChatError,
   Conversation,
   GeminiModelId,
+  ImageAspectRatio,
+  ImageStylePreset,
   PreparedImageAttachment,
 } from '../types/chat';
 import {ChatInput} from './ChatInput';
@@ -36,10 +38,17 @@ interface ChatWindowProps {
     content: string,
     attachments?: PreparedImageAttachment[]
   ) => Promise<string | null>;
+  onGenerateImage: (
+    prompt: string,
+    options?: {style?: ImageStylePreset; aspectRatio?: ImageAspectRatio}
+  ) => Promise<void>;
+  onRegenerateImage: (messageId: string) => Promise<void>;
+  onCancelImage: (messageId: string) => void;
   onStopGeneration: () => void;
   onRegenerate: (messageId?: string) => void;
   onEditMessage: (messageId: string, newContent: string) => void;
   onDismissError: () => void;
+  onWarmApi?: () => void;
 }
 
 const STARTER_PROMPTS = [
@@ -57,6 +66,11 @@ const STARTER_PROMPTS = [
     title: 'Draft clear communication',
     prompt:
       'Write a concise project update email summarizing completed milestones, risks, and next steps.',
+  },
+  {
+    title: 'Generate an AI image',
+    prompt:
+      'Generate a realistic luxury perfume product image on dark marble with warm studio lighting',
   },
   {
     title: 'Brainstorm architecture',
@@ -78,10 +92,14 @@ export function ChatWindow({
   onNewChat,
   onChangeModel,
   onSendMessage,
+  onGenerateImage,
+  onRegenerateImage,
+  onCancelImage,
   onStopGeneration,
   onRegenerate,
   onEditMessage,
   onDismissError,
+  onWarmApi,
 }: ChatWindowProps) {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -142,9 +160,10 @@ export function ChatWindow({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [previewImage]);
 
-  // Auto-scroll smoothly during streaming if user has not scrolled up
+  // Auto-scroll smoothly during streaming or image status transition if user has not scrolled up
+  const lastMsg = messages[messages.length - 1];
   const lastMessageContent =
-    streamingText || messages[messages.length - 1]?.content || '';
+    streamingText || lastMsg?.content || lastMsg?.generatedImage?.status || '';
   useEffect(() => {
     if (!shouldAutoScroll || messages.length === 0) return;
     if (isStreaming && scrollContainerRef.current) {
@@ -176,6 +195,23 @@ export function ChatWindow({
       void onSendMessage(content, attachments);
     },
     [onSendMessage]
+  );
+
+  const handleGenerateImageFromInput = useCallback(
+    (
+      prompt: string,
+      options: {style: ImageStylePreset; aspectRatio: ImageAspectRatio}
+    ) => {
+      void onGenerateImage(prompt, options);
+    },
+    [onGenerateImage]
+  );
+
+  const handleRegenerateImage = useCallback(
+    (messageId: string) => {
+      void onRegenerateImage(messageId);
+    },
+    [onRegenerateImage]
   );
 
   return (
@@ -268,7 +304,7 @@ export function ChatWindow({
                   What would you like to explore today?
                 </h2>
                 <p className="text-sm sm:text-base text-slate-500 dark:text-slate-400 max-w-lg mx-auto">
-                  Ask anything, upload an image or photo, or talk with Lumen by voice — chats stay saved locally in your browser.
+                  Ask anything, generate free AI images, upload photos, or talk by voice — chats stay saved locally in your browser.
                 </p>
               </div>
 
@@ -312,6 +348,8 @@ export function ChatWindow({
                   speechRate={speechRate}
                   onEditMessage={onEditMessage}
                   onRegenerate={onRegenerate}
+                  onRegenerateImage={handleRegenerateImage}
+                  onCancelImage={onCancelImage}
                   onToggleSpeak={togglePlayPause}
                   onStopSpeak={stopSpeech}
                   onChangeSpeechRate={setSpeechRate}
@@ -397,8 +435,10 @@ export function ChatWindow({
         <ChatInput
           isStreaming={isStreaming}
           onSend={handleSendFromInput}
+          onGenerateImage={handleGenerateImageFromInput}
           onStop={onStopGeneration}
           onOpenVoiceMode={handleOpenVoiceMode}
+          onWarmApi={onWarmApi}
           autoFocusTrigger={conversation?.id ?? 'empty'}
         />
       </div>

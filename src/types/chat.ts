@@ -6,6 +6,38 @@ export type SpeechLanguage = 'en-US' | 'ur-PK';
 
 export type SpeechRate = 0.75 | 1 | 1.25 | 1.5;
 
+export type ImageStylePreset =
+  | 'auto'
+  | 'photorealistic'
+  | 'cinematic'
+  | 'anime'
+  | 'cartoon'
+  | '3d-render'
+  | 'product'
+  | 'fashion'
+  | 'digital-art'
+  | 'logo'
+  | 'wallpaper';
+
+export type ImageAspectRatio = '1:1' | '16:9' | '9:16' | '4:3';
+
+export interface GeneratedImageData {
+  id: string;
+  prompt: string;
+  style: ImageStylePreset;
+  aspectRatio: ImageAspectRatio;
+  width: number;
+  height: number;
+  provider?: string;
+  model?: string;
+  status: 'generating' | 'ready' | 'error';
+  imageId?: string;
+  remoteUrl?: string;
+  error?: string;
+  durationMs?: number;
+  createdAt: number;
+}
+
 export interface ImageAttachmentRef {
   id: string;
   name: string;
@@ -26,6 +58,7 @@ export interface ChatMessage {
   role: MessageRole;
   content: string;
   attachments?: ImageAttachmentRef[];
+  generatedImage?: GeneratedImageData;
   createdAt: number;
   updatedAt?: number;
   isError?: boolean;

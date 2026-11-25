@@ -1,6 +1,8 @@
 import {
+  AlertCircle,
   Check,
   Copy,
+  Download,
   Loader2,
   Pause,
   Pencil,
@@ -8,6 +10,8 @@ import {
   RotateCcw,
   Square,
   Volume2,
+  WandSparkles,
+  X,
   ZoomIn,
 } from 'lucide-react';
 import {
@@ -24,10 +28,13 @@ import remarkGfm from 'remark-gfm';
 import type {SpeechPlaybackState} from '../hooks/useSpeechSynthesis';
 import type {
   ChatMessage as ChatMessageType,
+  GeneratedImageData,
+  ImageAspectRatio,
   ImageAttachmentRef,
   SpeechRate,
 } from '../types/chat';
 import {formatMessageTime} from '../utils/formatters';
+import {IMAGE_STYLE_OPTIONS} from '../utils/imageIntent';
 import {getImageRecord} from '../utils/imageStore';
 import {LoadingIndicator} from './LoadingIndicator';
 
@@ -41,6 +48,8 @@ interface ChatMessageProps {
   speechRate: SpeechRate;
   onEditMessage: (messageId: string, newContent: string) => void;
   onRegenerate: (messageId: string) => void;
+  onRegenerateImage: (messageId: string) => void;
+  onCancelImage: (messageId: string) => void;
   onToggleSpeak: (messageId: string, text: string) => void;
   onStopSpeak: () => void;
   onChangeSpeechRate: (rate: SpeechRate) => void;
@@ -99,6 +108,337 @@ function MessageImageThumb({
         <ZoomIn className="h-3.5 w-3.5" />
       </span>
     </button>
+  );
+}
+
+function getAspectClass(ratio: ImageAspectRatio): string {
+  switch (ratio) {
+    case '16:9':
+      return 'aspect-video max-w-lg';
+    case '9:16':
+      return 'aspect-[9/16] max-w-[260px]';
+    case '4:3':
+      return 'aspect-[4/3] max-w-md';
+    default:
+      return 'aspect-square max-w-sm';
+  }
+}
+
+function GeneratedImageCard({
+  messageId,
+  generatedImage,
+  onRegenerate,
+  onCancel,
+  onPreview,
+}: {
+  messageId: string;
+  generatedImage: GeneratedImageData;
+  onRegenerate: (messageId: string) => void;
+  onCancel: (messageId: string) => void;
+  onPreview: (src: string, alt: string) => void;
+}) {
+  const [imgSrc, setImgSrc] = useState<string | null>(
+    generatedImage.remoteUrl ?? null
+  );
+  const [imgMime, setImgMime] = useState<string>('image/jpeg');
+  const [isLoadingLocal, setIsLoadingLocal] = useState<boolean>(
+    generatedImage.status === 'ready' && Boolean(generatedImage.imageId)
+  );
+  const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [elapsedSec, setElapsedSec] = useState(0);
+
+  useEffect(() => {
+    if (generatedImage.status !== 'generating') {
+      setElapsedSec(0);
+      return;
+    }
+    const updateElapsed = () => {
+      setElapsedSec(
+        Math.max(0, Math.floor((Date.now() - generatedImage.createdAt) / 1000))
+      );
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(timer);
+  }, [generatedImage.status, generatedImage.createdAt]);
+
+  useEffect(() => {
+    let active = true;
+    if (generatedImage.status !== 'ready') {
+      setImgSrc(null);
+      setIsLoadingLocal(false);
+      return;
+    }
+
+    if (!generatedImage.imageId) {
+      setImgSrc(generatedImage.remoteUrl ?? null);
+      setIsLoadingLocal(false);
+      return;
+    }
+
+    setIsLoadingLocal(true);
+    void getImageRecord(generatedImage.imageId).then((record) => {
+      if (!active) return;
+      if (record?.dataUrl) {
+        setImgSrc(record.dataUrl);
+        setImgMime(record.mimeType);
+      } else if (generatedImage.remoteUrl) {
+        setImgSrc(generatedImage.remoteUrl);
+      } else {
+        setImgSrc(null);
+      }
+      setIsLoadingLocal(false);
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [generatedImage.status, generatedImage.imageId, generatedImage.remoteUrl]);
+
+  const styleLabel =
+    IMAGE_STYLE_OPTIONS.find((s) => s.id === generatedImage.style)?.label ??
+    'Auto';
+  const aspectClass = getAspectClass(generatedImage.aspectRatio);
+
+  const handleCopyPrompt = async () => {
+    try {
+      await navigator.clipboard.writeText(generatedImage.prompt);
+      setCopiedPrompt(true);
+      window.setTimeout(() => setCopiedPrompt(false), 1800);
+    } catch {
+      // Ignore clipboard failures
+    }
+  };
+
+  const handleDownload = async () => {
+    if (!imgSrc || isDownloading) return;
+    setIsDownloading(true);
+    const ext = imgMime.includes('png')
+      ? 'png'
+      : imgMime.includes('webp')
+        ? 'webp'
+        : 'jpg';
+    const filename = `lumen-image-${generatedImage.id.slice(0, 6)}.${ext}`;
+
+    try {
+      if (imgSrc.startsWith('data:')) {
+        const a = document.createElement('a');
+        a.href = imgSrc;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } else {
+        const res = await fetch(imgSrc);
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+      }
+    } catch {
+      // Download error ignored gracefully
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2.5">
+      {/* Prompt & Metadata Header */}
+      <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+        <span className="inline-flex items-center gap-1.5 font-medium text-teal-700 dark:text-teal-400">
+          <WandSparkles className="h-3.5 w-3.5" />
+          <span>Generated image</span>
+        </span>
+        {generatedImage.style !== 'auto' && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span>{styleLabel}</span>
+          </>
+        )}
+        <span aria-hidden="true">·</span>
+        <span className="tabular-nums">{generatedImage.aspectRatio}</span>
+      </div>
+
+      {/* Main Image Frame */}
+      {generatedImage.status === 'generating' && (
+        <div
+          className={`w-full ${aspectClass} rounded-2xl border border-slate-200 dark:border-slate-800 bg-gradient-to-br from-slate-100 via-slate-50 to-teal-50/50 dark:from-[#111827] dark:via-[#141D2F] dark:to-teal-950/30 flex flex-col items-center justify-center gap-3 p-6 text-center`}
+        >
+          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/90 dark:bg-slate-900/90 border border-slate-200 dark:border-slate-700 shadow-xs">
+            <Loader2 className="h-5 w-5 animate-spin text-teal-600 dark:text-teal-400" />
+          </div>
+          <div className="space-y-1 max-w-xs">
+            <p className="text-sm font-medium text-slate-800 dark:text-slate-200">
+              Creating image{elapsedSec > 0 ? ` · ${elapsedSec}s` : '...'}
+            </p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-2">
+              {generatedImage.prompt}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onCancel(messageId)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800 transition-colors"
+          >
+            <X className="h-3.5 w-3.5" />
+            <span>Cancel</span>
+          </button>
+        </div>
+      )}
+
+      {generatedImage.status === 'error' && (
+        <div className="max-w-lg rounded-2xl border border-red-200 dark:border-red-900/60 bg-red-50/70 dark:bg-red-950/30 p-4 space-y-3">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="h-4 w-4 shrink-0 text-red-600 dark:text-red-400 mt-0.5" />
+            <div className="space-y-1 min-w-0">
+              <p className="text-sm font-medium text-red-900 dark:text-red-200">
+                Image generation unavailable
+              </p>
+              <p className="text-xs text-red-800/90 dark:text-red-300 leading-relaxed">
+                {generatedImage.error ||
+                  'Free image providers are temporarily busy. Please try again.'}
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => onRegenerate(messageId)}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700 transition-colors"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              <span>Regenerate</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleCopyPrompt}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 dark:border-red-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+            >
+              {copiedPrompt ? (
+                <>
+                  <Check className="h-3.5 w-3.5 text-teal-600 dark:text-teal-400" />
+                  <span>Copied prompt</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="h-3.5 w-3.5" />
+                  <span>Copy prompt</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {generatedImage.status === 'ready' && (
+        <>
+          {isLoadingLocal ? (
+            <div
+              className={`w-full ${aspectClass} rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-[#111827] flex items-center justify-center`}
+            >
+              <Loader2 className="h-5 w-5 animate-spin text-teal-600 dark:text-teal-400" />
+            </div>
+          ) : imgSrc ? (
+            <button
+              type="button"
+              onClick={() => onPreview(imgSrc, generatedImage.prompt)}
+              aria-label={`Preview generated image: ${generatedImage.prompt}`}
+              className={`group/gen relative block w-full ${aspectClass} overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-[#111827] shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600`}
+            >
+              <img
+                src={imgSrc}
+                alt={generatedImage.prompt}
+                className="h-full w-full object-cover transition-transform duration-200 group-hover/gen:scale-[1.015]"
+              />
+              <span className="absolute bottom-2.5 right-2.5 inline-flex items-center gap-1 rounded-lg bg-slate-950/70 px-2 py-1 text-[11px] font-medium text-white opacity-0 group-hover/gen:opacity-100 transition-opacity">
+                <ZoomIn className="h-3.5 w-3.5" />
+                <span>Zoom</span>
+              </span>
+            </button>
+          ) : (
+            <div className="max-w-md rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#111827] p-4 space-y-2">
+              <p className="text-xs text-slate-600 dark:text-slate-400">
+                Local browser image cache was cleared. Click Regenerate to create this image again.
+              </p>
+              <button
+                type="button"
+                onClick={() => onRegenerate(messageId)}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 dark:bg-teal-600 px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90 transition-opacity"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>Regenerate</span>
+              </button>
+            </div>
+          )}
+
+          {/* Action Bar */}
+          <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 text-xs text-slate-400 dark:text-slate-500">
+            {imgSrc && (
+              <button
+                type="button"
+                onClick={() => void handleDownload()}
+                disabled={isDownloading}
+                className="inline-flex items-center gap-1.5 min-h-[30px] rounded-md px-2 py-1 text-slate-600 hover:text-slate-900 hover:bg-slate-100 dark:text-slate-300 dark:hover:text-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>{isDownloading ? 'Saving...' : 'Download'}</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => onRegenerate(messageId)}
+              className="inline-flex items-center gap-1.5 min-h-[30px] rounded-md px-2 py-1 text-slate-500 hover:text-slate-900 hover:bg-slate-100 dark:text-slate-400 dark:hover:text-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              <span>Regenerate</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleCopyPrompt}
+              className="inline-flex items-center gap-1.5 min-h-[30px] rounded-md px-2 py-1 text-slate-500 hover:text-slate-900 hover:bg-slate-100 dark:text-slate-400 dark:hover:text-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+            >
+              {copiedPrompt ? (
+                <>
+                  <Check className="h-3.5 w-3.5 text-teal-600 dark:text-teal-400" />
+                  <span>Copied</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="h-3.5 w-3.5" />
+                  <span>Copy prompt</span>
+                </>
+              )}
+            </button>
+
+            {generatedImage.model && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span>
+                  {generatedImage.model}
+                  {typeof generatedImage.durationMs === 'number'
+                    ? ` (${(generatedImage.durationMs / 1000).toFixed(1)}s)`
+                    : ''}
+                </span>
+              </>
+            )}
+
+            <span aria-hidden="true">·</span>
+            <span className="tabular-nums">
+              {formatMessageTime(generatedImage.createdAt)}
+            </span>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -167,6 +507,8 @@ export const ChatMessage = memo(function ChatMessage({
   speechRate,
   onEditMessage,
   onRegenerate,
+  onRegenerateImage,
+  onCancelImage,
   onToggleSpeak,
   onStopSpeak,
   onChangeSpeechRate,
@@ -337,7 +679,15 @@ export const ChatMessage = memo(function ChatMessage({
       </div>
 
       <div className="flex-1 min-w-0">
-        {isStreamingThis && !message.content ? (
+        {message.generatedImage ? (
+          <GeneratedImageCard
+            messageId={message.id}
+            generatedImage={message.generatedImage}
+            onRegenerate={onRegenerateImage}
+            onCancel={onCancelImage}
+            onPreview={onPreviewImage}
+          />
+        ) : isStreamingThis && !message.content ? (
           <LoadingIndicator label="Generating response" />
         ) : (
           <div className="markdown-body text-slate-800 dark:text-slate-200 min-w-0">

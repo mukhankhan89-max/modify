@@ -29,19 +29,37 @@ function isValidAttachment(value: unknown): boolean {
   );
 }
 
+function isValidGeneratedImage(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const img = value as Record<string, unknown>;
+  return (
+    typeof img.id === 'string' &&
+    typeof img.prompt === 'string' &&
+    typeof img.style === 'string' &&
+    typeof img.aspectRatio === 'string' &&
+    typeof img.width === 'number' &&
+    typeof img.height === 'number' &&
+    (img.status === 'generating' || img.status === 'ready' || img.status === 'error') &&
+    typeof img.createdAt === 'number'
+  );
+}
+
 function isValidMessage(value: unknown): boolean {
   if (!value || typeof value !== 'object') return false;
   const msg = value as Record<string, unknown>;
   const attachmentsValid =
     msg.attachments === undefined ||
     (Array.isArray(msg.attachments) && msg.attachments.every(isValidAttachment));
+  const generatedImageValid =
+    msg.generatedImage === undefined || isValidGeneratedImage(msg.generatedImage);
 
   return (
     typeof msg.id === 'string' &&
     (msg.role === 'user' || msg.role === 'assistant') &&
     typeof msg.content === 'string' &&
     typeof msg.createdAt === 'number' &&
-    attachmentsValid
+    attachmentsValid &&
+    generatedImageValid
   );
 }
 
@@ -67,6 +85,21 @@ export function loadConversations(): Conversation[] {
     if (!Array.isArray(parsed)) return [];
     return parsed
       .filter(isValidConversation)
+      .map((conv) => ({
+        ...conv,
+        messages: conv.messages.map((m) =>
+          m.generatedImage && m.generatedImage.status === 'generating'
+            ? {
+                ...m,
+                generatedImage: {
+                  ...m.generatedImage,
+                  status: 'error' as const,
+                  error: 'Image generation was interrupted. Click Regenerate to try again.',
+                },
+              }
+            : m
+        ),
+      }))
       .sort((a, b) => b.updatedAt - a.updatedAt);
   } catch {
     return [];

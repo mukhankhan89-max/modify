@@ -19,6 +19,11 @@ import {
   sanitizeIncomingMessages,
   transcribeAudioWithGemini,
 } from './api/_lib/gemini.js';
+import {
+  generateFreeImage,
+  ImageGenerationError,
+  normalizeImageRequest,
+} from './api/_lib/imageGen.js';
 
 dotenv.config({path: '.env.local'});
 dotenv.config();
@@ -112,7 +117,7 @@ async function startServer() {
             }
           : {
               systemInstruction: dynamicSystemInstruction,
-              maxOutputTokens: 1024,
+              maxOutputTokens: 800,
               abortSignal: abortController.signal,
             };
 
@@ -291,6 +296,46 @@ async function startServer() {
       res.status(classified.status).json({
         code: classified.code,
         error: classified.message,
+      });
+    }
+  });
+
+  app.post('/api/image', async (req, res) => {
+    const normalized = normalizeImageRequest(req.body);
+    if (normalized.error || !normalized.req) {
+      res.status(400).json({
+        code: 'INVALID_REQUEST',
+        error: normalized.error || 'Invalid image prompt.',
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        controller.abort();
+      }
+    });
+
+    try {
+      const result = await generateFreeImage(normalized.req, controller.signal);
+      res.setHeader('Cache-Control', 'no-store');
+      res.json(result);
+    } catch (err) {
+      if (err instanceof ImageGenerationError) {
+        res.status(err.status).json({
+          code: err.code,
+          error: err.message,
+          ...(err.fallbackClientUrl
+            ? {fallbackClientUrl: err.fallbackClientUrl}
+            : {}),
+        });
+        return;
+      }
+      console.error('[Server /api/image unexpected error]', err);
+      res.status(500).json({
+        code: 'IMAGE_GENERATION_FAILED',
+        error: 'Unable to generate image right now. Please try again.',
       });
     }
   });

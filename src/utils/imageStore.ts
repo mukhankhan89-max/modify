@@ -228,6 +228,52 @@ export async function saveImageRecord(
   }
 }
 
+export async function saveGeneratedImageRecord(params: {
+  id: string;
+  mimeType: string;
+  base64: string;
+  width: number;
+  height: number;
+}): Promise<string> {
+  const safeMime =
+    params.mimeType === 'image/png' || params.mimeType === 'image/webp'
+      ? params.mimeType
+      : 'image/jpeg';
+  const dataUrl = `data:${safeMime};base64,${params.base64}`;
+  const size = Math.floor((params.base64.length * 3) / 4);
+
+  const record: StoredImageRecord = {
+    id: params.id,
+    mimeType: safeMime,
+    dataUrl,
+    base64: params.base64,
+    width: params.width,
+    height: params.height,
+    size,
+  };
+  memoryFallbackStore.set(params.id, record);
+
+  try {
+    const db = await openMediaDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).put(record);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        reject(tx.error);
+      };
+    });
+  } catch {
+    // Keep memoryFallbackStore active if IndexedDB is restricted
+  }
+
+  return dataUrl;
+}
+
 export async function getImageRecord(id: string): Promise<StoredImageRecord | null> {
   const cached = memoryFallbackStore.get(id);
   if (cached) return cached;

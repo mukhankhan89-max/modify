@@ -4,13 +4,24 @@ import type {
   ChatMessage,
   Conversation,
   GeminiModelId,
+  ImageAspectRatio,
+  ImageStylePreset,
   PreparedImageAttachment,
 } from '../types/chat';
 import {createId, deriveFallbackTitle} from '../utils/formatters';
 import {
+  cleanImagePrompt,
+  composeStyledImagePrompt,
+  detectImageGenerationIntent,
+  getDimensionsForAspectRatio,
+  inferAspectRatioFromPrompt,
+  inferStyleFromPrompt,
+} from '../utils/imageIntent';
+import {
   clearAllImageRecords,
   deleteImageRecords,
   getImageRecord,
+  saveGeneratedImageRecord,
   saveImageRecord,
   stripPreparedToRef,
 } from '../utils/imageStore';
@@ -23,9 +34,10 @@ import {
   saveModel,
 } from '../utils/storage';
 
-// Send only recent relevant conversation turns to minimize payload and latency
-const MAX_HISTORY_MESSAGES = 8;
-const MAX_RECENT_IMAGE_TURNS = 2;
+// Send only recent relevant turns to minimize payload size and TTFT on Vercel
+const MAX_HISTORY_MESSAGES = 6;
+const MAX_RECENT_IMAGE_TURNS = 1;
+const WARMUP_INTERVAL_MS = 150_000;
 
 interface ApiImagePart {
   mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
@@ -43,6 +55,7 @@ interface StreamParams {
   historyForApi: ApiMessage[];
   assistantMessageId: string;
   modelToUse: GeminiModelId;
+  controller: AbortController;
 }
 
 async function buildCompactHistory(
@@ -90,15 +103,17 @@ async function buildCompactHistory(
 
   const finalSlice = combined.slice(-MAX_HISTORY_MESSAGES);
 
-  // Find up to MAX_RECENT_IMAGE_TURNS most recent messages that contain images
+  // Only forward images from the latest image turn (within the last 2 turns) to avoid re-uploading large payloads
   const imageTurnIndices = new Set<number>();
-  for (let i = finalSlice.length - 1; i >= 0; i--) {
+  const minImageTurnIndex = Math.max(0, finalSlice.length - 2);
+  for (let i = finalSlice.length - 1; i >= minImageTurnIndex; i--) {
     if (finalSlice[i].attachmentIds.length > 0) {
       imageTurnIndices.add(i);
       if (imageTurnIndices.size >= MAX_RECENT_IMAGE_TURNS) break;
     }
   }
 
+  // Fast synchronous path when no IndexedDB lookup is needed
   const result: ApiMessage[] = [];
   for (let i = 0; i < finalSlice.length; i++) {
     const turn = finalSlice[i];
@@ -134,7 +149,7 @@ async function buildCompactHistory(
   return result;
 }
 
-function collectAttachmentIds(messages: ChatMessage[]): string[] {
+function collectMediaIds(messages: ChatMessage[]): string[] {
   const ids: string[] = [];
   for (const m of messages) {
     if (m.attachments) {
@@ -142,8 +157,24 @@ function collectAttachmentIds(messages: ChatMessage[]): string[] {
         ids.push(att.id);
       }
     }
+    if (m.generatedImage?.imageId) {
+      ids.push(m.generatedImage.imageId);
+    }
   }
   return ids;
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      const commaIdx = result.indexOf(',');
+      resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+    };
+    reader.onerror = () => reject(new Error('Failed to read generated image data.'));
+    reader.readAsDataURL(blob);
+  });
 }
 
 export function useConversations() {
@@ -170,7 +201,11 @@ export function useConversations() {
   const [error, setError] = useState<ChatError | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+  const imageAbortControllersRef = useRef<
+    Map<string, {chatId: string; controller: AbortController}>
+  >(new Map());
   const isStreamingRef = useRef(false);
+  const lastWarmupAtRef = useRef<number>(0);
   const conversationsRef = useRef<Conversation[]>(conversations);
   conversationsRef.current = conversations;
   const activeStreamRef = useRef<{
@@ -179,10 +214,17 @@ export function useConversations() {
     text: string;
   } | null>(null);
 
-  // Pre-warm /api/chat serverless function on mount so cold start finishes before first prompt
-  useEffect(() => {
-    fetch('/api/chat', {method: 'GET'}).catch(() => {});
+  const warmChatApi = useCallback(() => {
+    const now = Date.now();
+    if (now - lastWarmupAtRef.current < WARMUP_INTERVAL_MS) return;
+    lastWarmupAtRef.current = now;
+    fetch('/api/chat', {method: 'GET', keepalive: true}).catch(() => {});
   }, []);
+
+  // Pre-warm /api/chat serverless function on mount so cold start completes before first prompt
+  useEffect(() => {
+    warmChatApi();
+  }, [warmChatApi]);
 
   useEffect(() => {
     saveActiveChatId(activeChatId);
@@ -192,11 +234,13 @@ export function useConversations() {
     saveModel(model);
   }, [model]);
 
-  // Persist only when idle (avoid JSON.stringify overhead on main thread during active streaming)
+  // Persist asynchronously when idle so JSON serialization never blocks UI painting
   useEffect(() => {
-    if (!streamingChatId) {
+    if (streamingChatId) return;
+    const timerId = window.setTimeout(() => {
       saveConversations(conversations);
-    }
+    }, 0);
+    return () => window.clearTimeout(timerId);
   }, [conversations, streamingChatId]);
 
   // Flush any in-flight streamed text if the user closes the tab mid-stream
@@ -294,10 +338,16 @@ export function useConversations() {
       }
       setError(null);
       const target = conversationsRef.current.find((c) => c.id === id);
+      for (const [msgId, entry] of imageAbortControllersRef.current.entries()) {
+        if (entry.chatId === id) {
+          entry.controller.abort();
+          imageAbortControllersRef.current.delete(msgId);
+        }
+      }
       if (target) {
-        const attachmentIds = collectAttachmentIds(target.messages);
-        if (attachmentIds.length > 0) {
-          void deleteImageRecords(attachmentIds);
+        const mediaIds = collectMediaIds(target.messages);
+        if (mediaIds.length > 0) {
+          void deleteImageRecords(mediaIds);
         }
       }
       setConversations((prev) => {
@@ -313,6 +363,10 @@ export function useConversations() {
 
   const clearAllChats = useCallback(() => {
     stopGeneration();
+    for (const entry of imageAbortControllersRef.current.values()) {
+      entry.controller.abort();
+    }
+    imageAbortControllersRef.current.clear();
     setError(null);
     setConversations([]);
     setActiveChatId(null);
@@ -320,13 +374,8 @@ export function useConversations() {
     void clearAllImageRecords();
   }, [stopGeneration]);
 
-  const streamAssistantReply = useCallback(
-    async ({
-      conversationId,
-      historyForApi,
-      assistantMessageId,
-      modelToUse,
-    }: StreamParams): Promise<string | null> => {
+  const beginOptimisticStream = useCallback(
+    (conversationId: string, assistantMessageId: string): AbortController => {
       stopGeneration();
       const controller = new AbortController();
       abortControllerRef.current = controller;
@@ -340,7 +389,19 @@ export function useConversations() {
       setStreamingMessageId(assistantMessageId);
       setStreamingText('');
       setError(null);
+      return controller;
+    },
+    [stopGeneration]
+  );
 
+  const streamAssistantReply = useCallback(
+    async ({
+      conversationId,
+      historyForApi,
+      assistantMessageId,
+      modelToUse,
+      controller,
+    }: StreamParams): Promise<string | null> => {
       let accumulatedText = '';
       let firstTokenRendered = false;
       let rafId: number | null = null;
@@ -420,6 +481,7 @@ export function useConversations() {
       };
 
       try {
+        lastWarmupAtRef.current = Date.now();
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
@@ -539,7 +601,375 @@ export function useConversations() {
         setStreamingText('');
       }
     },
-    [stopGeneration]
+    []
+  );
+
+  const runImageGenerationTask = useCallback(
+    async (params: {
+      conversationId: string;
+      assistantMessageId: string;
+      prompt: string;
+      style: ImageStylePreset;
+      width: number;
+      height: number;
+    }): Promise<void> => {
+      const existingEntry = imageAbortControllersRef.current.get(
+        params.assistantMessageId
+      );
+      if (existingEntry) {
+        existingEntry.controller.abort();
+        imageAbortControllersRef.current.delete(params.assistantMessageId);
+      }
+
+      const controller = new AbortController();
+      imageAbortControllersRef.current.set(params.assistantMessageId, {
+        chatId: params.conversationId,
+        controller,
+      });
+
+      const patchGeneratedImage = (
+        updater: (
+          current: NonNullable<ChatMessage['generatedImage']>
+        ) => NonNullable<ChatMessage['generatedImage']>
+      ) => {
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === params.conversationId
+              ? {
+                  ...c,
+                  updatedAt: Date.now(),
+                  messages: c.messages.map((m) =>
+                    m.id === params.assistantMessageId && m.generatedImage
+                      ? {...m, generatedImage: updater(m.generatedImage)}
+                      : m
+                  ),
+                }
+              : c
+          )
+        );
+      };
+
+      const composedPrompt = composeStyledImagePrompt(params.prompt, params.style);
+      const startedAt = Date.now();
+
+      try {
+        const response = await fetch('/api/image', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            prompt: composedPrompt,
+            width: params.width,
+            height: params.height,
+          }),
+          signal: controller.signal,
+        });
+
+        let resultPayload: {
+          imageBase64: string;
+          mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
+          provider: string;
+          model: string;
+          width: number;
+          height: number;
+          remoteUrl?: string;
+          durationMs: number;
+        } | null = null;
+
+        if (response.ok) {
+          resultPayload = (await response.json()) as typeof resultPayload;
+        } else {
+          let errMsg =
+            response.status === 404
+              ? 'Image API endpoint not found (404). Make sure /api/image is deployed on your host.'
+              : `Image generation failed (${response.status}).`;
+          let fallbackClientUrl: string | undefined;
+          try {
+            const errJson = (await response.json()) as {
+              error?: string;
+              fallbackClientUrl?: string;
+            };
+            if (errJson.error) errMsg = errJson.error;
+            if (errJson.fallbackClientUrl) {
+              fallbackClientUrl = errJson.fallbackClientUrl;
+            }
+          } catch {
+            // Non-JSON error body
+          }
+
+          // Single direct browser-IP fallback if server shared IP hit free quota
+          if (response.status === 429 && fallbackClientUrl) {
+            const directRes = await fetch(fallbackClientUrl, {
+              signal: controller.signal,
+            });
+            const directCt = (directRes.headers.get('content-type') || '').toLowerCase();
+            if (directRes.ok && directCt.startsWith('image/')) {
+              const blob = await directRes.blob();
+              if (blob.size >= 1500) {
+                const base64 = await blobToBase64(blob);
+                resultPayload = {
+                  imageBase64: base64,
+                  mimeType: directCt.includes('png')
+                    ? 'image/png'
+                    : directCt.includes('webp')
+                      ? 'image/webp'
+                      : 'image/jpeg',
+                  provider: 'Pollinations AI',
+                  model: 'FLUX',
+                  width: params.width,
+                  height: params.height,
+                  remoteUrl: fallbackClientUrl,
+                  durationMs: Date.now() - startedAt,
+                };
+              }
+            }
+          }
+
+          if (!resultPayload) {
+            throw new Error(errMsg);
+          }
+        }
+
+        if (!resultPayload?.imageBase64) {
+          throw new Error('Image provider returned an empty image.');
+        }
+
+        const recordId = createId();
+        await saveGeneratedImageRecord({
+          id: recordId,
+          mimeType: resultPayload.mimeType,
+          base64: resultPayload.imageBase64,
+          width: resultPayload.width,
+          height: resultPayload.height,
+        });
+
+        patchGeneratedImage((current) => ({
+          ...current,
+          status: 'ready',
+          imageId: recordId,
+          provider: resultPayload!.provider,
+          model: resultPayload!.model,
+          width: resultPayload!.width,
+          height: resultPayload!.height,
+          remoteUrl: resultPayload!.remoteUrl,
+          durationMs: resultPayload!.durationMs,
+          error: undefined,
+        }));
+      } catch (err) {
+        if (controller.signal.aborted) {
+          patchGeneratedImage((current) => ({
+            ...current,
+            status: 'error',
+            error: 'Image generation canceled.',
+          }));
+          return;
+        }
+        const message =
+          err instanceof Error
+            ? err.message
+            : 'Unable to generate image right now. Please try again.';
+        patchGeneratedImage((current) => ({
+          ...current,
+          status: 'error',
+          error: message,
+        }));
+      } finally {
+        const tracked = imageAbortControllersRef.current.get(params.assistantMessageId);
+        if (tracked?.controller === controller) {
+          imageAbortControllersRef.current.delete(params.assistantMessageId);
+        }
+      }
+    },
+    []
+  );
+
+  const generateImage = useCallback(
+    async (
+      rawPrompt: string,
+      options?: {
+        style?: ImageStylePreset;
+        aspectRatio?: ImageAspectRatio;
+        skipIntentClean?: boolean;
+        displayContent?: string;
+      }
+    ): Promise<void> => {
+      const trimmedInput = rawPrompt.trim();
+      if (!trimmedInput) return;
+
+      const cleanPrompt = options?.skipIntentClean
+        ? trimmedInput
+        : cleanImagePrompt(trimmedInput) || trimmedInput;
+
+      const resolvedStyle =
+        options?.style !== undefined
+          ? options.style
+          : inferStyleFromPrompt(trimmedInput);
+      const resolvedRatio =
+        options?.aspectRatio !== undefined
+          ? options.aspectRatio
+          : inferAspectRatioFromPrompt(trimmedInput);
+      const {width, height} = getDimensionsForAspectRatio(resolvedRatio);
+
+      const now = Date.now();
+      const userMsg: ChatMessage = {
+        id: createId(),
+        role: 'user',
+        content: options?.displayContent ?? trimmedInput,
+        createdAt: now,
+      };
+      const assistantMsg: ChatMessage = {
+        id: createId(),
+        role: 'assistant',
+        content: '',
+        createdAt: now + 1,
+        generatedImage: {
+          id: createId(),
+          prompt: cleanPrompt,
+          style: resolvedStyle,
+          aspectRatio: resolvedRatio,
+          width,
+          height,
+          status: 'generating',
+          createdAt: now + 1,
+        },
+      };
+
+      const titleSeed = deriveFallbackTitle(cleanPrompt);
+      let targetChatId = activeChatId;
+      const existing = conversationsRef.current.find((c) => c.id === targetChatId);
+
+      if (!existing) {
+        targetChatId = createId();
+        const newChat: Conversation = {
+          id: targetChatId,
+          title: titleSeed,
+          isAutoTitled: true,
+          createdAt: now,
+          updatedAt: now,
+          messages: [userMsg, assistantMsg],
+        };
+        setConversations((prev) => [newChat, ...prev]);
+        setActiveChatId(targetChatId);
+      } else {
+        const isFirstMessage = existing.messages.length === 0;
+        const shouldAutoTitle = isFirstMessage && existing.isAutoTitled !== false;
+        const updatedTitle = shouldAutoTitle ? titleSeed : existing.title;
+
+        setConversations((prev) => {
+          const updated = prev.map((c) =>
+            c.id === targetChatId
+              ? {
+                  ...c,
+                  title: updatedTitle,
+                  updatedAt: now,
+                  messages: [...c.messages, userMsg, assistantMsg],
+                }
+              : c
+          );
+          return updated.sort((a, b) => b.updatedAt - a.updatedAt);
+        });
+      }
+
+      setError(null);
+
+      // Launch non-blocking concurrent image generation without locking chat input
+      void runImageGenerationTask({
+        conversationId: targetChatId!,
+        assistantMessageId: assistantMsg.id,
+        prompt: cleanPrompt,
+        style: resolvedStyle,
+        width,
+        height,
+      });
+    },
+    [activeChatId, runImageGenerationTask]
+  );
+
+  const cancelImageGeneration = useCallback((assistantMessageId: string) => {
+    const entry = imageAbortControllersRef.current.get(assistantMessageId);
+    if (entry) {
+      entry.controller.abort();
+      imageAbortControllersRef.current.delete(assistantMessageId);
+    }
+    setConversations((prev) =>
+      prev.map((c) => ({
+        ...c,
+        messages: c.messages.map((m) =>
+          m.id === assistantMessageId && m.generatedImage
+            ? {
+                ...m,
+                generatedImage: {
+                  ...m.generatedImage,
+                  status: 'error',
+                  error: 'Image generation canceled.',
+                },
+              }
+            : m
+        ),
+      }))
+    );
+  }, []);
+
+  const regenerateImage = useCallback(
+    async (assistantMessageId: string) => {
+      let targetConv: Conversation | undefined;
+      let targetMsg: ChatMessage | undefined;
+
+      for (const conv of conversationsRef.current) {
+        const found = conv.messages.find((m) => m.id === assistantMessageId);
+        if (found?.generatedImage) {
+          targetConv = conv;
+          targetMsg = found;
+          break;
+        }
+      }
+
+      if (!targetConv || !targetMsg?.generatedImage) return;
+
+      const oldImg = targetMsg.generatedImage;
+      if (oldImg.imageId) {
+        void deleteImageRecords([oldImg.imageId]);
+      }
+
+      const now = Date.now();
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === targetConv!.id
+            ? {
+                ...c,
+                updatedAt: now,
+                messages: c.messages.map((m) =>
+                  m.id === assistantMessageId && m.generatedImage
+                    ? {
+                        ...m,
+                        generatedImage: {
+                          ...m.generatedImage,
+                          status: 'generating',
+                          imageId: undefined,
+                          remoteUrl: undefined,
+                          provider: undefined,
+                          model: undefined,
+                          durationMs: undefined,
+                          error: undefined,
+                          createdAt: now,
+                        },
+                      }
+                    : m
+                ),
+              }
+            : c
+        )
+      );
+
+      await runImageGenerationTask({
+        conversationId: targetConv.id,
+        assistantMessageId,
+        prompt: oldImg.prompt,
+        style: oldImg.style,
+        width: oldImg.width,
+        height: oldImg.height,
+      });
+    },
+    [runImageGenerationTask]
   );
 
   const sendMessage = useCallback(
@@ -549,12 +979,26 @@ export function useConversations() {
     ): Promise<string | null> => {
       const content = rawContent.trim();
       const hasImages = Boolean(preparedImages && preparedImages.length > 0);
-      if ((!content && !hasImages) || isStreaming || isStreamingRef.current) {
+      if (!content && !hasImages) {
         return null;
       }
 
-      if (preparedImages && preparedImages.length > 0) {
-        await Promise.all(preparedImages.map((img) => saveImageRecord(img)));
+      // Automatic free AI image generation intent detection (non-blocking)
+      if (!hasImages) {
+        const intent = detectImageGenerationIntent(content);
+        if (intent.isImageIntent) {
+          await generateImage(intent.prompt, {
+            style: intent.inferredStyle,
+            aspectRatio: intent.inferredRatio,
+            skipIntentClean: true,
+            displayContent: content,
+          });
+          return null;
+        }
+      }
+
+      if (isStreaming || isStreamingRef.current) {
+        return null;
       }
 
       const attachmentRefs =
@@ -585,7 +1029,7 @@ export function useConversations() {
 
       let targetChatId = activeChatId;
       const existing = conversationsRef.current.find((c) => c.id === targetChatId);
-      let historyForApi: ApiMessage[] = [];
+      const precedingMessages = existing ? existing.messages : [];
 
       if (!existing) {
         targetChatId = createId();
@@ -597,20 +1041,12 @@ export function useConversations() {
           updatedAt: now,
           messages: [userMsg, assistantMsg],
         };
-        historyForApi = await buildCompactHistory([], {
-          content,
-          preparedImages,
-        });
         setConversations((prev) => [newChat, ...prev]);
         setActiveChatId(targetChatId);
       } else {
         const isFirstMessage = existing.messages.length === 0;
         const shouldAutoTitle = isFirstMessage && existing.isAutoTitled !== false;
         const updatedTitle = shouldAutoTitle ? titleSeed : existing.title;
-        historyForApi = await buildCompactHistory(existing.messages, {
-          content,
-          preparedImages,
-        });
 
         setConversations((prev) => {
           const updated = prev.map((c) =>
@@ -627,17 +1063,35 @@ export function useConversations() {
         });
       }
 
-      if (targetChatId) {
-        return await streamAssistantReply({
-          conversationId: targetChatId,
-          historyForApi,
-          assistantMessageId: assistantMsg.id,
-          modelToUse: model,
-        });
+      // Immediately enter streaming UI state synchronously (0ms optimistic feedback)
+      const controller = beginOptimisticStream(targetChatId!, assistantMsg.id);
+
+      // Persist images to IndexedDB in background without blocking API launch
+      if (preparedImages && preparedImages.length > 0) {
+        void Promise.all(preparedImages.map((img) => saveImageRecord(img)));
       }
-      return null;
+
+      const historyForApi = await buildCompactHistory(precedingMessages, {
+        content,
+        preparedImages,
+      });
+
+      return await streamAssistantReply({
+        conversationId: targetChatId!,
+        historyForApi,
+        assistantMessageId: assistantMsg.id,
+        modelToUse: model,
+        controller,
+      });
     },
-    [activeChatId, isStreaming, model, streamAssistantReply]
+    [
+      activeChatId,
+      beginOptimisticStream,
+      generateImage,
+      isStreaming,
+      model,
+      streamAssistantReply,
+    ]
   );
 
   const regenerateResponse = useCallback(
@@ -659,12 +1113,15 @@ export function useConversations() {
       const now = Date.now();
 
       if (cutIndex >= 0 && chat.messages[cutIndex]?.role === 'assistant') {
-        const assistantId = chat.messages[cutIndex].id;
+        const targetAssistant = chat.messages[cutIndex];
+        if (targetAssistant.generatedImage) {
+          await regenerateImage(targetAssistant.id);
+          return;
+        }
+        const assistantId = targetAssistant.id;
         const precedingMessages = chat.messages.slice(0, cutIndex);
-        const historyForApi = await buildCompactHistory(precedingMessages);
 
-        if (historyForApi.length === 0) return;
-
+        const controller = beginOptimisticStream(activeChatId, assistantId);
         setConversations((prev) =>
           prev.map((c) =>
             c.id === activeChatId
@@ -685,11 +1142,15 @@ export function useConversations() {
           )
         );
 
+        const historyForApi = await buildCompactHistory(precedingMessages);
+        if (historyForApi.length === 0) return;
+
         await streamAssistantReply({
           conversationId: activeChatId,
           historyForApi,
           assistantMessageId: assistantId,
           modelToUse: model,
+          controller,
         });
         return;
       }
@@ -706,8 +1167,8 @@ export function useConversations() {
         content: '',
         createdAt: now,
       };
-      const historyForApi = await buildCompactHistory(baseMessages);
 
+      const controller = beginOptimisticStream(activeChatId, newAssistantMsg.id);
       setConversations((prev) =>
         prev.map((c) =>
           c.id === activeChatId
@@ -720,14 +1181,23 @@ export function useConversations() {
         )
       );
 
+      const historyForApi = await buildCompactHistory(baseMessages);
       await streamAssistantReply({
         conversationId: activeChatId,
         historyForApi,
         assistantMessageId: newAssistantMsg.id,
         modelToUse: model,
+        controller,
       });
     },
-    [activeChatId, isStreaming, model, streamAssistantReply]
+    [
+      activeChatId,
+      beginOptimisticStream,
+      isStreaming,
+      model,
+      regenerateImage,
+      streamAssistantReply,
+    ]
   );
 
   const editMessage = useCallback(
@@ -742,13 +1212,32 @@ export function useConversations() {
       if (msgIndex === -1 || chat.messages[msgIndex].role !== 'user') return;
 
       const targetMsg = chat.messages[msgIndex];
-      const hasAttachments = Boolean(targetMsg.attachments && targetMsg.attachments.length > 0);
+      const hasAttachments = Boolean(
+        targetMsg.attachments && targetMsg.attachments.length > 0
+      );
       if (!trimmed && !hasAttachments) return;
 
-      const discardedIds = collectAttachmentIds(chat.messages.slice(msgIndex + 1));
+      const discardedMsgs = chat.messages.slice(msgIndex + 1);
+      for (const m of discardedMsgs) {
+        const entry = imageAbortControllersRef.current.get(m.id);
+        if (entry) {
+          entry.controller.abort();
+          imageAbortControllersRef.current.delete(m.id);
+        }
+      }
+
+      const discardedIds = collectMediaIds(discardedMsgs);
       if (discardedIds.length > 0) {
         void deleteImageRecords(discardedIds);
       }
+
+      const previousGenerated = chat.messages[msgIndex + 1]?.generatedImage;
+      const detectedIntent = !hasAttachments
+        ? detectImageGenerationIntent(trimmed)
+        : null;
+      const shouldGenerateImage =
+        Boolean(detectedIntent?.isImageIntent) ||
+        (Boolean(previousGenerated) && !hasAttachments);
 
       const now = Date.now();
       const updatedUserMsg: ChatMessage = {
@@ -756,6 +1245,64 @@ export function useConversations() {
         content: trimmed,
         updatedAt: now,
       };
+      const prefixMessages = [...chat.messages.slice(0, msgIndex), updatedUserMsg];
+      const shouldUpdateTitle = msgIndex === 0 && chat.isAutoTitled !== false;
+
+      if (shouldGenerateImage) {
+        const cleanPrompt = detectedIntent?.isImageIntent
+          ? detectedIntent.prompt
+          : cleanImagePrompt(trimmed) || trimmed;
+        const resolvedStyle =
+          detectedIntent?.isImageIntent && detectedIntent.inferredStyle !== 'auto'
+            ? detectedIntent.inferredStyle
+            : previousGenerated?.style ?? inferStyleFromPrompt(trimmed);
+        const resolvedRatio =
+          detectedIntent?.isImageIntent && detectedIntent.inferredRatio !== '1:1'
+            ? detectedIntent.inferredRatio
+            : previousGenerated?.aspectRatio ?? inferAspectRatioFromPrompt(trimmed);
+        const {width, height} = getDimensionsForAspectRatio(resolvedRatio);
+
+        const newAssistantMsg: ChatMessage = {
+          id: createId(),
+          role: 'assistant',
+          content: '',
+          createdAt: now + 1,
+          generatedImage: {
+            id: createId(),
+            prompt: cleanPrompt,
+            style: resolvedStyle,
+            aspectRatio: resolvedRatio,
+            width,
+            height,
+            status: 'generating',
+            createdAt: now + 1,
+          },
+        };
+
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === activeChatId
+              ? {
+                  ...c,
+                  title: shouldUpdateTitle ? deriveFallbackTitle(cleanPrompt) : c.title,
+                  updatedAt: now,
+                  messages: [...prefixMessages, newAssistantMsg],
+                }
+              : c
+          )
+        );
+
+        await runImageGenerationTask({
+          conversationId: activeChatId,
+          assistantMessageId: newAssistantMsg.id,
+          prompt: cleanPrompt,
+          style: resolvedStyle,
+          width,
+          height,
+        });
+        return;
+      }
+
       const newAssistantMsg: ChatMessage = {
         id: createId(),
         role: 'assistant',
@@ -763,10 +1310,7 @@ export function useConversations() {
         createdAt: now + 1,
       };
 
-      const prefixMessages = [...chat.messages.slice(0, msgIndex), updatedUserMsg];
-      const historyForApi = await buildCompactHistory(prefixMessages);
-      const shouldUpdateTitle = msgIndex === 0 && chat.isAutoTitled !== false;
-
+      const controller = beginOptimisticStream(activeChatId, newAssistantMsg.id);
       setConversations((prev) =>
         prev.map((c) =>
           c.id === activeChatId
@@ -784,14 +1328,23 @@ export function useConversations() {
         )
       );
 
+      const historyForApi = await buildCompactHistory(prefixMessages);
       await streamAssistantReply({
         conversationId: activeChatId,
         historyForApi,
         assistantMessageId: newAssistantMsg.id,
         modelToUse: model,
+        controller,
       });
     },
-    [activeChatId, isStreaming, model, streamAssistantReply]
+    [
+      activeChatId,
+      beginOptimisticStream,
+      isStreaming,
+      model,
+      runImageGenerationTask,
+      streamAssistantReply,
+    ]
   );
 
   return {
@@ -805,12 +1358,16 @@ export function useConversations() {
     streamingText,
     error,
     dismissError,
+    warmChatApi,
     createChat,
     selectChat,
     renameChat,
     deleteChat,
     clearAllChats,
     sendMessage,
+    generateImage,
+    regenerateImage,
+    cancelImageGeneration,
     stopGeneration,
     regenerateResponse,
     editMessage,

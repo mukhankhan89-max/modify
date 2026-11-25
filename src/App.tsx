@@ -19,12 +19,16 @@ export default function App() {
     streamingText,
     error,
     dismissError,
+    warmChatApi,
     createChat,
     selectChat,
     renameChat,
     deleteChat,
     clearAllChats,
     sendMessage,
+    generateImage,
+    regenerateImage,
+    cancelImageGeneration,
     stopGeneration,
     regenerateResponse,
     editMessage,
@@ -74,10 +78,14 @@ export default function App() {
           onNewChat={createChat}
           onChangeModel={setModel}
           onSendMessage={sendMessage}
+          onGenerateImage={generateImage}
+          onRegenerateImage={regenerateImage}
+          onCancelImage={cancelImageGeneration}
           onStopGeneration={stopGeneration}
           onRegenerate={regenerateResponse}
           onEditMessage={editMessage}
           onDismissError={dismissError}
+          onWarmApi={warmChatApi}
         />
       </main>
 

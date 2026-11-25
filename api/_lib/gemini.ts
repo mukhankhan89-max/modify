@@ -4,7 +4,7 @@ import {GoogleGenAI} from '@google/genai';
 export const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite', 'gemini-4-hydrogen']);
 export const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 export const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
-export const MAX_HISTORY_MESSAGES = 8;
+export const MAX_HISTORY_MESSAGES = 6;
 export const MAX_IMAGES_PER_MESSAGE = 3;
 export const MAX_IMAGE_BASE64_CHARS = 4_000_000;
 export const MAX_AUDIO_BASE64_CHARS = 8_000_000;
@@ -35,7 +35,7 @@ export const ALLOWED_TTS_VOICES = new Set([
 ]);
 
 export const BASE_SYSTEM_INSTRUCTION =
-  'You are Lumen, a fast, friendly AI assistant. Answer directly in 1-5 sentences by default (no intros, filler, "Sure!", or sign-offs); expand only when asked. Reply in the user\'s language (English, Urdu, or Roman Urdu). When images are provided, analyze objects, colors, text/OCR, screenshots, products, and documents accurately. Give clean fenced code blocks with language tags.';
+  'You are Lumen, an ultra-fast AI assistant. Reply directly in 1-4 sentences by default (no intros, filler, or sign-offs); expand only when asked. Match the user\'s language (English, Urdu, or Roman Urdu). Analyze images accurately and use fenced code blocks with language tags.';
 
 export interface IncomingImagePart {
   mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
@@ -355,13 +355,13 @@ export function buildGeminiContents(validMessages: IncomingMessage[]): GeminiCon
   return validMessages.map((m, idx) => {
     const isRecent = idx >= validMessages.length - 2;
     const text =
-      !isRecent && m.content.length > 900
-        ? `${m.content.slice(0, 900)}...`
+      !isRecent && m.content.length > 550
+        ? `${m.content.slice(0, 550)}...`
         : m.content;
 
     const parts: GeminiPart[] = [];
-    // Include images only on recent turns to keep request latency & payload low
-    if (m.images && m.images.length > 0 && (isRecent || idx === validMessages.length - 3)) {
+    // Include images only on the latest 2 turns to keep request latency & payload low
+    if (m.images && m.images.length > 0 && isRecent) {
       for (const img of m.images) {
         parts.push({
           inlineData: {
@@ -373,7 +373,7 @@ export function buildGeminiContents(validMessages: IncomingMessage[]): GeminiCon
       parts.push({
         text: text.trim()
           ? text
-          : 'Analyze this image and clearly describe or explain what is shown.',
+          : 'Analyze this image and describe or answer clearly.',
       });
     } else {
       parts.push({text});

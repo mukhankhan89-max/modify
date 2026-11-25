@@ -11,9 +11,10 @@ import {
   sanitizeIncomingMessages,
 } from './_lib/gemini.js';
 
-// Lightweight warmup endpoint so client mount pre-warms this Vercel function before first message
+// Lightweight warmup endpoint so client mount/focus pre-warms this Vercel function before first message
 export function GET(): Response {
   const configured = Boolean(getGenAIClient());
+  buildSystemInstruction(BASE_SYSTEM_INSTRUCTION);
   return Response.json(
     {ok: true, configured},
     {headers: {'Cache-Control': 'no-store'}}
@@ -97,7 +98,7 @@ export async function POST(request: Request): Promise<Response> {
               }
             : {
                 systemInstruction: dynamicSystemInstruction,
-                maxOutputTokens: 1024,
+                maxOutputTokens: 800,
                 abortSignal: abortController.signal,
               };
 

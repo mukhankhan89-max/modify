@@ -6,9 +6,11 @@ import {
   Loader2,
   Mic,
   Square,
+  WandSparkles,
   X,
 } from 'lucide-react';
 import {
+  memo,
   useCallback,
   useEffect,
   useRef,
@@ -17,7 +19,15 @@ import {
   type DragEvent,
 } from 'react';
 import {useSpeechRecognition} from '../hooks/useSpeechRecognition';
-import type {PreparedImageAttachment} from '../types/chat';
+import type {
+  ImageAspectRatio,
+  ImageStylePreset,
+  PreparedImageAttachment,
+} from '../types/chat';
+import {
+  IMAGE_ASPECT_RATIOS,
+  IMAGE_STYLE_OPTIONS,
+} from '../utils/imageIntent';
 import {
   MAX_IMAGES_PER_MESSAGE,
   prepareImageAttachment,
@@ -26,16 +36,23 @@ import {
 interface ChatInputProps {
   isStreaming: boolean;
   onSend: (message: string, attachments?: PreparedImageAttachment[]) => void;
+  onGenerateImage: (
+    prompt: string,
+    options: {style: ImageStylePreset; aspectRatio: ImageAspectRatio}
+  ) => void;
   onStop: () => void;
   onOpenVoiceMode: () => void;
+  onWarmApi?: () => void;
   autoFocusTrigger?: string | null;
 }
 
-export function ChatInput({
+export const ChatInput = memo(function ChatInput({
   isStreaming,
   onSend,
+  onGenerateImage,
   onStop,
   onOpenVoiceMode,
+  onWarmApi,
   autoFocusTrigger,
 }: ChatInputProps) {
   const [value, setValue] = useState('');
@@ -43,6 +60,9 @@ export function ChatInput({
   const [isProcessingImage, setIsProcessingImage] = useState(false);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const [isImageMode, setIsImageMode] = useState(false);
+  const [imageStyle, setImageStyle] = useState<ImageStylePreset>('auto');
+  const [imageRatio, setImageRatio] = useState<ImageAspectRatio>('1:1');
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -107,6 +127,7 @@ export function ChatInput({
           prepared.push(item);
         }
         if (prepared.length > 0) {
+          setIsImageMode(false);
           setAttachments((prev) => [...prev, ...prepared].slice(0, MAX_IMAGES_PER_MESSAGE));
         }
         if (files.length > remainingSlots) {
@@ -174,6 +195,23 @@ export function ChatInput({
 
   const handleSubmit = () => {
     const trimmed = value.trim();
+    if (isImageMode) {
+      if (!trimmed || isTranscribing) return;
+      if (isListening) {
+        stopListening();
+      }
+      onGenerateImage(trimmed, {
+        style: imageStyle,
+        aspectRatio: imageRatio,
+      });
+      setValue('');
+      setMediaError(null);
+      if (textareaRef.current) {
+        textareaRef.current.style.height = '40px';
+      }
+      return;
+    }
+
     if ((!trimmed && attachments.length === 0) || isStreaming || isProcessingImage) {
       return;
     }
@@ -191,11 +229,12 @@ export function ChatInput({
   };
 
   const activeError = mediaError || speechError;
-  const canSend =
-    (value.trim().length > 0 || attachments.length > 0) &&
-    !isStreaming &&
-    !isProcessingImage &&
-    !isTranscribing;
+  const canSend = isImageMode
+    ? value.trim().length > 0 && !isTranscribing
+    : (value.trim().length > 0 || attachments.length > 0) &&
+      !isStreaming &&
+      !isProcessingImage &&
+      !isTranscribing;
 
   return (
     <div className="w-full max-w-3xl mx-auto px-3 sm:px-6 pb-3 sm:pb-5 pt-2">
@@ -254,9 +293,71 @@ export function ChatInput({
         className={`relative flex flex-col rounded-2xl bg-slate-50 dark:bg-[#111827] border shadow-sm transition-colors ${
           isDraggingOver
             ? 'border-teal-600 ring-2 ring-teal-600/30 dark:border-teal-400'
-            : 'border-slate-200 dark:border-slate-800 focus-within:border-teal-600 dark:focus-within:border-teal-500 focus-within:ring-1 focus-within:ring-teal-600/30 dark:focus-within:ring-teal-500/30'
+            : isImageMode
+              ? 'border-teal-500/70 dark:border-teal-500/60 ring-1 ring-teal-500/20'
+              : 'border-slate-200 dark:border-slate-800 focus-within:border-teal-600 dark:focus-within:border-teal-500 focus-within:ring-1 focus-within:ring-teal-600/30 dark:focus-within:ring-teal-500/30'
         }`}
       >
+        {/* Free AI Image Generation Options Strip */}
+        {isImageMode && (
+          <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 pt-2.5 pb-1.5 border-b border-slate-200/80 dark:border-slate-800/90 text-xs">
+            <div className="flex flex-wrap items-center gap-2 min-w-0">
+              <span className="inline-flex items-center gap-1.5 font-semibold text-teal-700 dark:text-teal-400 shrink-0">
+                <WandSparkles className="h-3.5 w-3.5" />
+                <span>Create Image</span>
+              </span>
+
+              <label className="inline-flex items-center gap-1.5">
+                <span className="text-slate-500 dark:text-slate-400 hidden sm:inline">
+                  Style
+                </span>
+                <select
+                  aria-label="Image style preset"
+                  value={imageStyle}
+                  onChange={(e) => setImageStyle(e.target.value as ImageStylePreset)}
+                  className="h-7 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 text-xs font-medium text-slate-700 dark:text-slate-200 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                >
+                  {IMAGE_STYLE_OPTIONS.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div
+                role="group"
+                aria-label="Image aspect ratio"
+                className="inline-flex items-center rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-0.5"
+              >
+                {IMAGE_ASPECT_RATIOS.map((ratio) => (
+                  <button
+                    key={ratio.id}
+                    type="button"
+                    onClick={() => setImageRatio(ratio.id)}
+                    className={`px-1.5 py-0.5 rounded text-[11px] font-medium transition-colors ${
+                      imageRatio === ratio.id
+                        ? 'bg-teal-600 text-white'
+                        : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+                    }`}
+                  >
+                    {ratio.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setIsImageMode(false)}
+              aria-label="Exit image generation mode"
+              title="Back to chat mode"
+              className="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-200/70 dark:hover:text-slate-200 dark:hover:bg-slate-800 transition-colors"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
         {/* Image Attachment Previews */}
         {(attachments.length > 0 || isProcessingImage) && (
           <div className="flex flex-wrap items-center gap-2.5 px-3.5 pt-3 pb-1">
@@ -341,7 +442,11 @@ export function ChatInput({
             ref={textareaRef}
             rows={1}
             value={value}
-            onChange={(e) => setValue(e.target.value)}
+            onFocus={onWarmApi}
+            onChange={(e) => {
+              onWarmApi?.();
+              setValue(e.target.value);
+            }}
             onPaste={handlePaste}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -350,11 +455,13 @@ export function ChatInput({
               }
             }}
             placeholder={
-              attachments.length > 0
-                ? 'Ask a question about your image, or send as-is...'
-                : 'Message Lumen...'
+              isImageMode
+                ? 'Describe the image you want to create (e.g., realistic luxury perfume bottle on marble)...'
+                : attachments.length > 0
+                  ? 'Ask a question about your image, or send as-is...'
+                  : 'Message Lumen or ask to generate an image...'
             }
-            aria-label="Message input"
+            aria-label={isImageMode ? 'Image prompt input' : 'Message input'}
             className="w-full min-h-[40px] max-h-[180px] resize-none bg-transparent py-1 text-[15px] leading-relaxed text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none"
           />
         </div>
@@ -362,6 +469,26 @@ export function ChatInput({
         {/* Bottom Composer Action Row */}
         <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-1">
           <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => {
+                setIsImageMode((prev) => !prev);
+                textareaRef.current?.focus();
+              }}
+              disabled={attachments.length > 0}
+              aria-pressed={isImageMode}
+              aria-label="Toggle AI image generation mode"
+              title="Generate image for free"
+              className={`inline-flex h-9 items-center gap-1.5 px-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                isImageMode
+                  ? 'bg-teal-600 text-white hover:bg-teal-500'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:text-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              <WandSparkles className="h-4 w-4" />
+              <span className="hidden sm:inline">Image</span>
+            </button>
+
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
@@ -411,7 +538,7 @@ export function ChatInput({
             <button
               type="button"
               onClick={() => void startListening()}
-              disabled={isStreaming || isTranscribing}
+              disabled={(isStreaming && !isImageMode) || isTranscribing}
               aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
               title={isListening ? 'Stop voice input' : 'Dictate with microphone'}
               className={`inline-flex h-9 w-9 items-center justify-center rounded-xl transition-colors ${
@@ -442,7 +569,7 @@ export function ChatInput({
               <span className="hidden sm:inline">Voice</span>
             </button>
 
-            {isStreaming ? (
+            {isStreaming && !isImageMode ? (
               <button
                 type="button"
                 onClick={onStop}
@@ -457,15 +584,19 @@ export function ChatInput({
                 type="button"
                 onClick={handleSubmit}
                 disabled={!canSend}
-                aria-label="Send message"
-                title="Send message"
+                aria-label={isImageMode ? 'Generate image' : 'Send message'}
+                title={isImageMode ? 'Generate image' : 'Send message'}
                 className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 ${
                   canSend
                     ? 'bg-slate-900 text-white hover:bg-slate-800 dark:bg-teal-600 dark:text-white dark:hover:bg-teal-500'
                     : 'bg-slate-200 text-slate-400 cursor-not-allowed dark:bg-slate-800 dark:text-slate-600'
                 }`}
               >
-                <ArrowUp className="h-[18px] w-[18px]" />
+                {isImageMode ? (
+                  <WandSparkles className="h-4 w-4" />
+                ) : (
+                  <ArrowUp className="h-[18px] w-[18px]" />
+                )}
               </button>
             )}
           </div>
@@ -473,8 +604,10 @@ export function ChatInput({
       </div>
 
       <p className="mt-1.5 hidden sm:block text-center text-xs text-slate-400 dark:text-slate-500">
-        Enter to send · Shift + Enter for new line · Drag, paste, or upload images
+        {isImageMode
+          ? 'Free AI image generation · Uses public providers with automatic fallback'
+          : 'Enter to send · Shift + Enter for new line · Type a prompt or toggle Image to generate'}
       </p>
     </div>
   );
-}
+});
